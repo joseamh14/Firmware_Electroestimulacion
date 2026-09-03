@@ -1,0 +1,6 @@
+Debug/
+Release/
+*.launch
+CLAUDE.md
+contexto_sesion_anterior.md
+.git_old/
