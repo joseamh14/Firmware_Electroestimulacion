@@ -6,6 +6,8 @@
  */
 #include "uart_protocol.h"
 #include "session_fsm.h"
+#include "current_calc.h"
+#include "sd_logger.h"
 #include "usbd_cdc_if.h"
 
 #include <string.h>
@@ -22,9 +24,13 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 #define UART_RX_RING_SIZE      (256U)   /* potencia de 2 (mascara)          */
 #define UART_RX_RING_MASK      (UART_RX_RING_SIZE - 1U)
 #define UART_LINE_MAX          (64U)    /* longitud maxima de comando       */
-#define UART_MAX_TOKENS        (5U)     /* el comando mas largo usa 4       */
+#define UART_MAX_TOKENS        (5U)     /* el comando mas largo (SET CAL) usa 5 */
 #define UART_TX_BUF_SIZE       (320U)   /* la linea de STATUS cabe de sobra */
 #define UART_TX_SPIN_LIMIT     (200000UL) /* techo de espera de la pila USB */
+#define UART_DEC_MAX_INT       (100000UL) /* parte entera maxima de un decimal */
+#define UART_DEC_MAX_FRAC_DIV  (1000000UL) /* hasta 6 decimales             */
+#define UART_GAIN_DECIMALS     (6U)
+#define UART_OFFSET_DECIMALS   (3U)
 
 /* ------------------------------------------------------------------------- *
  *  Estado interno
@@ -184,6 +190,87 @@ static int Tokenize(char *line, char **argv, uint32_t max)
     return (int)n;
 }
 
+/* Convierte un decimal con signo opcional ("-12.345", "1.0021", "7") a
+ * float, sin depender de strtof. Separador decimal: punto. Hasta 6
+ * decimales y parte entera < 100000; cualquier otra cosa es error. */
+static bool ParseDecimal(const char *s, float *out)
+{
+    if (s == NULL || *s == '\0') {
+        return false;
+    }
+    const char *p = s;
+    bool neg = false;
+    if (*p == '+' || *p == '-') {
+        neg = (*p == '-');
+        p++;
+    }
+    uint32_t ip = 0U;
+    uint32_t fp = 0U;
+    uint32_t fdiv = 1U;
+    bool dot = false;
+    bool any_digit = false;
+    for (; *p != '\0'; p++) {
+        if (*p == '.') {
+            if (dot) {
+                return false;
+            }
+            dot = true;
+            continue;
+        }
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        any_digit = true;
+        uint32_t d = (uint32_t)(*p - '0');
+        if (!dot) {
+            if (ip >= UART_DEC_MAX_INT) {
+                return false;
+            }
+            ip = ip * 10U + d;
+        } else {
+            if (fdiv >= UART_DEC_MAX_FRAC_DIV) {
+                return false;
+            }
+            fp = fp * 10U + d;
+            fdiv *= 10U;
+        }
+    }
+    if (!any_digit) {
+        return false;
+    }
+    float v = (float)ip + (float)fp / (float)fdiv;
+    *out = neg ? -v : v;
+    return true;
+}
+
+/* Escribe v con 'decimals' cifras decimales sin usar printf de coma
+ * flotante (no enlazado en newlib-nano por defecto). */
+static void FormatFixed(char *buf, size_t size, float v, uint32_t decimals)
+{
+    if (decimals > 9U) {
+        decimals = 9U;
+    }
+    uint32_t pow10 = 1U;
+    for (uint32_t i = 0U; i < decimals; i++) {
+        pow10 *= 10U;
+    }
+    bool neg = (v < 0.0f);
+    float a = neg ? -v : v;
+    uint64_t scaled = (uint64_t)(a * (float)pow10 + 0.5f);
+    unsigned long ip = (unsigned long)(scaled / pow10);
+    uint32_t fp = (uint32_t)(scaled % pow10);
+
+    /* Cifras decimales a mano (con ceros a la izquierda), sin depender de
+     * que el printf de newlib-nano admita la anchura con '*'. */
+    char frac[12];
+    for (uint32_t i = decimals; i > 0U; i--) {
+        frac[i - 1U] = (char)('0' + (fp % 10U));
+        fp /= 10U;
+    }
+    frac[decimals] = '\0';
+    (void)snprintf(buf, size, "%s%lu.%s", neg ? "-" : "", ip, frac);
+}
+
 /* ------------------------------------------------------------------------- *
  *  Interpretacion de comandos
  * ------------------------------------------------------------------------- */
@@ -299,13 +386,150 @@ static void HandleStart(int argc, char **argv)
     uint32_t off_s = off_hours * SESSION_SECONDS_PER_HOUR;
     uint32_t dur_s = days      * SESSION_SECONDS_PER_DAY;
 
-    /* SessionFSM_Start rechaza tambien la combinacion incoherente
-     * (duracion total menor que un tramo de estimulacion completo). */
+    /* Combinacion incoherente (duracion total menor que un tramo de
+     * estimulacion completo) -> rango; fallo al aplicar -> hardware. */
+    if (!SessionFSM_StartParamsValid(on_s, off_s, dur_s)) {
+        SendErr("RANGE");
+        return;
+    }
     if (SessionFSM_Start(on_s, off_s, dur_s) != HAL_OK) {
+        SendErr("HW");
+        return;
+    }
+    SendOk();
+}
+
+static void HandleSetCal(int argc, char **argv)
+{
+    uint32_t channel;
+    float gain;
+    float offset_ua;
+    if (argc != 5) {
+        SendErr("SYNTAX");
+        return;
+    }
+    if (!ParseU32(argv[2], &channel) || !ParseDecimal(argv[3], &gain) ||
+        !ParseDecimal(argv[4], &offset_ua)) {
+        SendErr("SYNTAX");
+        return;
+    }
+    if (channel < 1U || channel > CURRENT_CALC_NUM_CH) {
+        SendErr("RANGE");
+        return;
+    }
+    if (CurrentCalc_SetCalibration((uint8_t)channel, gain, offset_ua) != HAL_OK) {
+        SendErr("RANGE");   /* ganancia u offset fuera de los limites */
+        return;
+    }
+    SendOk();
+}
+
+static void HandleSetVref(int argc, char **argv)
+{
+    uint32_t vref_mv;
+    if (argc != 3) {
+        SendErr("SYNTAX");
+        return;
+    }
+    if (!ParseU32(argv[2], &vref_mv)) {
+        SendErr("SYNTAX");
+        return;
+    }
+    if (vref_mv > 0xFFFFU || CurrentCalc_SetVrefMillivolts((uint16_t)vref_mv) != HAL_OK) {
         SendErr("RANGE");
         return;
     }
     SendOk();
+}
+
+static void HandleGetCal(int argc, char **argv)
+{
+    uint32_t channel;
+    CurrentCalc_Cal_t cal;
+    char gain_txt[24];
+    char off_txt[24];
+    if (argc != 3) {
+        SendErr("SYNTAX");
+        return;
+    }
+    if (!ParseU32(argv[2], &channel)) {
+        SendErr("SYNTAX");
+        return;
+    }
+    if (channel < 1U || channel > CURRENT_CALC_NUM_CH ||
+        CurrentCalc_GetCalibration((uint8_t)channel, &cal) != HAL_OK) {
+        SendErr("RANGE");
+        return;
+    }
+    FormatFixed(gain_txt, sizeof(gain_txt), cal.gain, UART_GAIN_DECIMALS);
+    FormatFixed(off_txt, sizeof(off_txt), cal.offset_ua, UART_OFFSET_DECIMALS);
+
+    int n = snprintf((char *)s_tx, sizeof(s_tx), "CAL CH=%lu GAIN=%s OFFSET_UA=%s VREF_MV=%u\n",
+                     (unsigned long)channel, gain_txt, off_txt,
+                     (unsigned)CurrentCalc_GetVrefMillivolts());
+    if (n > 0) {
+        uint16_t len = (n >= (int)sizeof(s_tx)) ? (uint16_t)(sizeof(s_tx) - 1U)
+                                                : (uint16_t)n;
+        UartTx(s_tx, len);
+    }
+    SendOk();
+}
+
+static const char *LogStateName(SdLogState_t st)
+{
+    switch (st) {
+        case SD_LOG_ACTIVE:  return "ON";
+        case SD_LOG_NO_CARD: return "NOSD";
+        case SD_LOG_OFF:
+        default:             return "OFF";
+    }
+}
+
+static void HandleGetCur(int argc)
+{
+    SdLogStatus_t st;
+    char val[20];
+    if (argc != 2) {
+        SendErr("SYNTAX");
+        return;
+    }
+    SdLogger_GetStatus(&st);
+
+    int n = snprintf((char *)s_tx, sizeof(s_tx), "CUR LOG=%s FILE=%s REC=%lu UA=",
+                     LogStateName(st.state), (st.file[0] != '\0') ? st.file : "-",
+                     (unsigned long)st.records);
+    for (uint8_t i = 0U; i < CURRENT_LOG_NUM_CH && n > 0 && n < (int)sizeof(s_tx); i++) {
+        float v = st.last_ua[i];
+        if (!st.have_values || v != v) {   /* v != v: NaN */
+            (void)snprintf(val, sizeof(val), "NAN");
+        } else {
+            FormatFixed(val, sizeof(val), v, UART_OFFSET_DECIMALS);
+        }
+        n += snprintf((char *)s_tx + n, sizeof(s_tx) - (size_t)n, "%s%s",
+                      val, (i + 1U < CURRENT_LOG_NUM_CH) ? "," : "\n");
+    }
+    if (n > 0) {
+        uint16_t len = (n >= (int)sizeof(s_tx)) ? (uint16_t)(sizeof(s_tx) - 1U)
+                                                : (uint16_t)n;
+        UartTx(s_tx, len);
+    }
+    SendOk();
+}
+
+static void HandleEepromSafe(int argc, char **argv)
+{
+    if (argc != 2 || !StrEqualCI(argv[1], "SAFE")) {
+        SendErr("SYNTAX");
+        return;
+    }
+    HAL_StatusTypeDef st = SessionFSM_StoreAmplifierSafeDefault();
+    if (st == HAL_BUSY) {
+        SendErr("STATE");   /* solo en IDLE */
+    } else if (st != HAL_OK) {
+        SendErr("HW");
+    } else {
+        SendOk();
+    }
 }
 
 static void ProcessLine(void)
@@ -330,6 +554,10 @@ static void ProcessLine(void)
             HandleSetFreq(argc, argv);
         } else if (StrEqualCI(argv[1], "WELL")) {
             HandleSetWell(argc, argv);
+        } else if (StrEqualCI(argv[1], "CAL")) {
+            HandleSetCal(argc, argv);
+        } else if (StrEqualCI(argv[1], "VREF")) {
+            HandleSetVref(argc, argv);
         } else {
             SendErr("SYNTAX");
         }
@@ -349,6 +577,24 @@ static void ProcessLine(void)
         } else {
             SendStatus();
         }
+    } else if (StrEqualCI(argv[0], "GET")) {
+        if (argc >= 2 && StrEqualCI(argv[1], "CAL")) {
+            HandleGetCal(argc, argv);
+        } else if (argc >= 2 && StrEqualCI(argv[1], "CUR")) {
+            HandleGetCur(argc);
+        } else {
+            SendErr("SYNTAX");
+        }
+    } else if (StrEqualCI(argv[0], "SAVE")) {
+        if (argc != 2 || !StrEqualCI(argv[1], "CAL")) {
+            SendErr("SYNTAX");
+        } else if (CurrentCalc_SaveToFlash() != HAL_OK) {
+            SendErr("HW");
+        } else {
+            SendOk();
+        }
+    } else if (StrEqualCI(argv[0], "EEPROM")) {
+        HandleEepromSafe(argc, argv);
     } else {
         SendErr("SYNTAX");
     }

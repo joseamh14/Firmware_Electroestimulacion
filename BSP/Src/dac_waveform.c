@@ -23,6 +23,29 @@ typedef struct {
 static DAC_HandleTypeDef *s_hdac;
 static DacBankState_t s_bank[2];
 
+/* Bit TENx (habilitacion de disparo externo) del canal en DAC_CR. Mismo
+ * desplazamiento que usa la HAL para el canal 2: (Channel & 0x10). */
+static uint32_t TriggerEnableBit(uint32_t dac_channel)
+{
+    return (uint32_t)(DAC_CR_TEN1 << (dac_channel & 0x10UL));
+}
+
+/* Deja el canal del banco con la onda parada y la salida fija en
+ * DAC_CODE_MID (Dif = 0). Con TENx = 0 el DAC copia DHR en DOR sin esperar
+ * disparo, asi que el valor se aplica aunque el timer este parado. TENx se
+ * modifica con el canal deshabilitado (HAL_DAC_Stop_DMA lo deshabilita). */
+static void ParkBank(DacBankState_t *st)
+{
+    HAL_TIM_Base_Stop(st->htim);
+    HAL_DAC_Stop_DMA(s_hdac, st->dac_channel);
+
+    CLEAR_BIT(s_hdac->Instance->CR, TriggerEnableBit(st->dac_channel));
+    HAL_DAC_SetValue(s_hdac, st->dac_channel, DAC_ALIGN_12B_R, DAC_CODE_MID);
+    HAL_DAC_Start(s_hdac, st->dac_channel);
+
+    st->running = false;
+}
+
 /* Mismo buscador de (prescaler, autorecarga) que en la version anterior
  * del driver de frecuencia -- ver justificacion en el historial del
  * proyecto. Trabaja sobre la frecuencia de DISPARO (2x la de la onda). */
@@ -69,9 +92,7 @@ HAL_StatusTypeDef DacWaveform_Init(DAC_HandleTypeDef *hdac,
 
     for (uint8_t b = 0; b < 2U; b++) {
         s_bank[b].current_freq_hz = 0U;
-        s_bank[b].running = false;
-        HAL_TIM_Base_Stop(s_bank[b].htim);
-        HAL_DAC_Stop_DMA(s_hdac, s_bank[b].dac_channel);
+        ParkBank(&s_bank[b]);
     }
 
     return HAL_OK;
@@ -104,6 +125,10 @@ HAL_StatusTypeDef DacWaveform_SetFrequency(DacBank_t bank, uint32_t freq_hz)
     HAL_TIM_Base_Stop(st->htim);
     HAL_DAC_Stop_DMA(s_hdac, st->dac_channel);
 
+    /* Si el banco venia aparcado, se reactiva el disparo por TRGO (el canal
+     * esta deshabilitado en este punto, condicion para tocar TENx). */
+    SET_BIT(s_hdac->Instance->CR, TriggerEnableBit(st->dac_channel));
+
     __HAL_TIM_SET_PRESCALER(st->htim, psc);
     __HAL_TIM_SET_AUTORELOAD(st->htim, arr);
     __HAL_TIM_SET_COUNTER(st->htim, 0U);
@@ -111,6 +136,7 @@ HAL_StatusTypeDef DacWaveform_SetFrequency(DacBank_t bank, uint32_t freq_hz)
     HAL_StatusTypeDef status = HAL_DAC_Start_DMA(s_hdac, st->dac_channel, st->buffer, 2U,
                                                    DAC_ALIGN_12B_R);
     if (status != HAL_OK) {
+        ParkBank(st); /* no dejar el canal deshabilitado (salida flotante) */
         return status;
     }
     HAL_TIM_Base_Start(st->htim);
@@ -130,9 +156,7 @@ HAL_StatusTypeDef DacWaveform_Stop(DacBank_t bank)
         return HAL_ERROR;
     }
 
-    HAL_TIM_Base_Stop(st->htim);
-    HAL_DAC_Stop_DMA(s_hdac, st->dac_channel);
-    st->running = false;
+    ParkBank(st);
     return HAL_OK;
 }
 

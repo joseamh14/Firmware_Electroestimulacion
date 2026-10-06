@@ -26,6 +26,10 @@
 #include "ad5144.h"
 #include "dac_waveform.h"
 #include "culture_selector.h"
+#include "tia_mux.h"
+#include "current_calc.h"
+#include "tia_reader.h"
+#include "sd_logger.h"
 #include "session_fsm.h"
 #include "uart_protocol.h"
 /* USER CODE END Includes */
@@ -47,6 +51,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 DAC_HandleTypeDef hdac1;
 DMA_HandleTypeDef hdma_dac1_ch1;
@@ -141,17 +146,22 @@ int main(void)
     Error_Handler();
   }
   /* AD5144_Init hace un ping I2C: sin la placa fisica devolvera != HAL_OK,
-   * pero eso no debe bloquear el arranque. La postura segura la mantiene
-   * AD5144_AllChannelsZero (wiper a 0) mas abajo. */
-  (void)AD5144_Init(&ad5144_bank_a, &hi2c1, AD5144_I2C_ADDR_ADDR_VLOG);  /* U1: ADDR=VDD */
-  (void)AD5144_Init(&ad5144_bank_b, &hi2c1, AD5144_I2C_ADDR_ADDR_GND);   /* U2: ADDR=GND */
+   * pero eso no debe bloquear el arranque. La postura segura la mantienen
+   * el DAC aparcado en VBIAS (DacWaveform_Init), AD5144_AllChannelsZero
+   * (ganancia minima, codigo 255) y los pocillos a GND. */
+  (void)AD5144_Init(&ad5144_bank_a, &hi2c1, AD5144_I2C_ADDR_ADDR_VLOG);  /* U1: ADDR=2V5=VLOGIC -> 0x28 */
+  (void)AD5144_Init(&ad5144_bank_b, &hi2c1, AD5144_I2C_ADDR_ADDR_GND);   /* U2: ADDR=GND        -> 0x2B */
   (void)AD5144_AllChannelsZero(&ad5144_bank_a);
   (void)AD5144_AllChannelsZero(&ad5144_bank_b);
   (void)CultureSelector_AllDisconnect();
+  CurrentCalc_Init();
+  (void)CurrentCalc_LoadFromFlash();   /* sin calibracion guardada: valores por defecto */
+  (void)TiaReader_Init(&hadc1);        /* calibra el ADC; lectura parada */
 
   /* --- Capa App: FSM de sesion (reanuda desde backup si procede) y parser --- */
   (void)SessionFSM_Init(&hrtc, &ad5144_bank_a, &ad5144_bank_b);
   UartProtocol_Init();
+  SdLogger_Init();
 
   /* USER CODE END 2 */
 
@@ -164,6 +174,8 @@ int main(void)
     /* USER CODE BEGIN 3 */
     SessionFSM_Task();      /* transiciones ON/REST del protocolo          */
     UartProtocol_Task();    /* comandos del host por USB CDC               */
+    TiaReader_Task();       /* rafagas de medida de corriente              */
+    SdLogger_Task();        /* ventanas de 1 s y registro en la microSD    */
     HAL_IWDG_Refresh(&hiwdg); /* solo desde el bucle sano: si esto se
                                 cuelga, el IWDG resetea y no se sigue
                                 estimulando sin control */
@@ -273,13 +285,13 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T1_TRGO;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+  hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
   hadc1.Init.OversamplingMode = DISABLE;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -334,7 +346,7 @@ static void MX_DAC1_Init(void)
   */
   sConfig.DAC_SampleAndHold = DAC_SAMPLEANDHOLD_DISABLE;
   sConfig.DAC_Trigger = DAC_TRIGGER_T1_TRGO;
-  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_DISABLE;
+  sConfig.DAC_HighFrequency = DAC_HIGH_FREQUENCY_INTERFACE_MODE_AUTOMATIC;
   sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
   sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_DISABLE;
   sConfig.DAC_UserTrimming = DAC_TRIMMING_FACTORY;
@@ -529,8 +541,8 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
   hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
   hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
-  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_DISABLE;
-  hsd1.Init.ClockDiv = 0;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
+  hsd1.Init.ClockDiv = 4;
   hsd1.Init.Transceiver = SDMMC_TRANSCEIVER_DISABLE;
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
@@ -649,6 +661,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
 
 }
 
@@ -702,6 +717,10 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Selector TIA (MAX4581): ENABLE es activo a nivel bajo, asi que el nivel
+   * Low que deja CubeMX en PB10 lo habilitaria. Se deja deshabilitado
+   * (todos los interruptores abiertos) hasta que la lectura lo pida. */
+  TiaMux_Disable();
 
   /* USER CODE END MX_GPIO_Init_2 */
 }

@@ -16,6 +16,24 @@
  *        - magic invalido  -> IDLE;
  *        - parametros imposibles con CRC valido -> IDLE;
  *        - reloj incoherente (marcha atras) -> IDLE.
+ *   4. Copia en flash (VBAT unido a VDD: el corte borra el backup Y
+ *      reinicia el calendario del RTC):
+ *        - punto de control cada 60 s, ademas de en cada transicion/consigna;
+ *        - corte total -> reanuda desde el ultimo punto (<= 60 s perdidos,
+ *          el tiempo sin alimentacion no cuenta);
+ *        - STOP deja un registro IDLE: la sesion parada no resucita;
+ *        - si el backup del RTC es valido, manda sobre la flash;
+ *        - registro de flash imposible -> IDLE;
+ *        - fallo de escritura en flash no detiene la estimulacion.
+ *   5. Mantenimiento EEPROM del AD5144 solo en IDLE.
+ *   6. Seguridad de salida:
+ *        - un pocillo de la mascara con amplitud 0 queda a GND (el AD5144 no
+ *          da 0 V por si solo), y se conecta/desconecta al cambiar la
+ *          amplitud en caliente;
+ *        - un canal cuya escritura en el AD5144 falla queda desconectado;
+ *        - START con fallo de hardware -> sesion cancelada y apagado seguro;
+ *        - consigna o frecuencia que fallan en caliente -> se conserva el
+ *          valor anterior y no se persiste.
  ******************************************************************************
  */
 #include "mock_hal.h"
@@ -64,10 +82,11 @@ static void banks_init(void)
     AD5144_Init(&g_bankB, NULL, AD5144_I2C_ADDR_ADDR_VLOG);
 }
 
-/* Arranque limpio: reloj a BASE_UNIX, backup borrado, espias a cero. */
+/* Arranque limpio: reloj a BASE_UNIX, backup y flash borrados, espias a cero. */
 static void fresh_boot(void)
 {
     MockBKP_Reset();
+    MockFlash_Reset();
     MockSpy_Reset();
     MockRTC_SetUnix(BASE_UNIX);
     banks_init();
@@ -92,7 +111,7 @@ static uint32_t crc32_ref(const uint32_t *words, uint32_t count)
             crc ^= (w & 0xFFU);
             w >>= 8;
             for (uint8_t k = 0U; k < 8U; k++) {
-                crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88520UL) : (crc >> 1);
+                crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320UL) : (crc >> 1);
             }
         }
     }
@@ -314,6 +333,7 @@ static void test_recover_bad_crc(void)
     MockRTC_AdvanceSeconds(2*H); SessionFSM_Task();
 
     MockBKP_Raw()[W_DURATION_S] ^= 0x1;   /* payload alterado, CRC sin tocar */
+    MockFlash_Reset();   /* se aisla la validacion del backup (sin copia en flash) */
 
     reboot_keep_backup();
     CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "CRC malo -> IDLE");
@@ -333,6 +353,7 @@ static void test_recover_bad_magic(void)
     MockRTC_AdvanceSeconds(2*H); SessionFSM_Task();
 
     MockBKP_Raw()[W_MAGIC] = 0xDEADBEEFUL;
+    MockFlash_Reset();
 
     reboot_keep_backup();
     CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "magic malo -> IDLE");
@@ -351,6 +372,7 @@ static void test_recover_implausible_params(void)
     /* on_seconds = 0 (por debajo del minimo) pero con CRC recalculado */
     MockBKP_Raw()[W_ON_S] = 0U;
     backup_reseal();
+    MockFlash_Reset();
 
     reboot_keep_backup();
     CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "params fuera de rango -> IDLE");
@@ -403,6 +425,269 @@ static void test_cold_boot_idle(void)
     CHECK_EQ_U(st.well_mask, 0, "sin pocillos activos");
 }
 
+
+/* ================================================================== *
+ *  11. Copia en flash: puntos de control
+ * ================================================================== */
+#define Y2000_UNIX   (946684800ULL)   /* 2000-01-01 00:00:00: fecha que fija
+                                          MX_RTC_Init tras perder el backup */
+
+/* Indices del payload de flash (ver session_fsm.c). */
+#define F_STATE      0
+#define F_ELAPSED    1
+#define F_ON_S       2
+#define F_DURATION   4
+
+/* Corte total: se pierden los registros de backup y el calendario vuelve a
+ * 2000-01-01; la flash se conserva. */
+static void power_loss_reboot(void)
+{
+    MockBKP_Reset();
+    MockRTC_SetUnix(Y2000_UNIX);
+    MockSpy_Reset();
+    banks_init();
+    SessionFSM_Init(&g_hrtc, &g_bankA, &g_bankB);
+}
+
+/* Avanza 'secs' segundos llamando a la FSM una vez por segundo. */
+static void run_seconds(uint32_t secs)
+{
+    for (uint32_t i = 0; i < secs; i++) {
+        MockRTC_AdvanceSeconds(1U);
+        SessionFSM_Task();
+    }
+}
+
+static void test_flash_checkpoints(void)
+{
+    printf("[test] flash: puntos de control\n");
+    fresh_boot();
+    CHECK_EQ_U(MockFlash_AppendCount(), 0, "arranque en frio no escribe flash");
+
+    CHECK(SessionFSM_Start(6*H, 6*H, 3*D) == HAL_OK, "START aceptado");
+    int n0 = MockFlash_AppendCount();
+    CHECK(n0 >= 1, "START deja copia en flash");
+    CHECK_EQ_U(MockFlash_LastWords()[F_STATE], SESSION_STATE_STIM_ON, "copia: STIM_ON");
+    CHECK_EQ_U(MockFlash_LastWords()[F_ELAPSED], 0, "copia: 0 s transcurridos");
+
+    run_seconds(59);
+    CHECK_EQ_U(MockFlash_AppendCount(), n0, "59 s: sin punto de control");
+    run_seconds(1);
+    CHECK_EQ_U(MockFlash_AppendCount(), n0 + 1, "60 s: un punto de control");
+    CHECK_EQ_U(MockFlash_LastWords()[F_ELAPSED], 60, "punto de control con 60 s");
+
+    run_seconds(600);
+    CHECK_EQ_U(MockFlash_AppendCount(), n0 + 11, "11 minutos: 11 puntos de control");
+
+    int n1 = MockFlash_AppendCount();
+    SessionFSM_SetChannelMillivolts(2, 800);
+    CHECK_EQ_U(MockFlash_AppendCount(), n1 + 1, "cambio de consigna con sesion armada -> copia");
+
+    /* Un dia entero llamando a la FSM cada segundo: cadencia 1/min */
+    fresh_boot();
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    n0 = MockFlash_AppendCount();
+    run_seconds(24U*3600U);
+    int per_day = MockFlash_AppendCount() - n0;
+    printf("   escrituras en flash en 24 h: %d\n", per_day);
+    CHECK(per_day >= 1440 && per_day <= 1444, "1440 puntos/dia (+ transiciones ON/REST)");
+}
+
+static void test_flash_power_loss(void)
+{
+    printf("[test] flash: corte total con perdida del backup y del calendario\n");
+    fresh_boot();
+    SessionFSM_SetChannelMillivolts(4, 1234);
+    SessionFSM_SetBankFrequency(DAC_BANK_A, 100000);
+    SessionFSM_SetWell(4, true);
+    CHECK(SessionFSM_Start(6*H, 6*H, 3*D) == HAL_OK, "START aceptado");
+
+    run_seconds(7U*3600U + 30U);   /* 7 h 30 s: REST, ultimo punto en 7 h 0 min */
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_REST, "pre-corte: REST");
+
+    power_loss_reboot();
+    SessionStatus_t st;
+    SessionFSM_GetStatus(&st);
+    CHECK_EQ_U(st.state, SESSION_STATE_STIM_REST, "post-corte: retoma REST");
+    CHECK(st.elapsed_total_s <= 7U*3600U + 30U && st.elapsed_total_s >= 7U*3600U + 30U - 60U,
+          "tiempo de sesion = ultimo punto de control (<= 60 s perdidos)");
+    CHECK_EQ_U(st.on_seconds, 6*H, "on_seconds recuperado");
+    CHECK_EQ_U(st.duration_seconds, 3*D, "duracion recuperada");
+    CHECK_EQ_U(st.amp_mv[3], 1234, "amplitud canal 4 recuperada");
+    CHECK_EQ_U(st.freq_hz[DAC_BANK_A], 100000, "frecuencia recuperada");
+    CHECK_EQ_U(st.well_mask, 0x08, "pocillos recuperados");
+    CHECK(MockBKP_Raw()[W_MAGIC] != 0U, "se reconstruye el backup del RTC");
+
+    /* El tiempo sin alimentacion no cuenta: la sesion sigue desde ahi */
+    uint32_t t_resume = st.elapsed_total_s;
+    MockSpy_Reset();
+    run_seconds(12U*3600U - t_resume + 5U);   /* llega a 12 h 5 s de sesion */
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_ON, "siguiente ON a las 12 h de sesion");
+    CHECK_EQ_U(g_spy.ad_setmv_last_mv[3], 1234, "ON aplica la amplitud recuperada");
+
+    /* Segundo corte en ON, ahora con el backup tambien perdido */
+    run_seconds(125);
+    power_loss_reboot();
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_ON, "segundo corte: retoma ON");
+    CHECK(g_spy.ad_setmv_calls == 8, "al reanudar en ON se vuelcan las 8 amplitudes");
+}
+
+static void test_flash_stop_and_priority(void)
+{
+    printf("[test] flash: STOP no resucita, backup manda, registro imposible\n");
+
+    /* STOP -> registro IDLE -> tras corte, IDLE */
+    fresh_boot();
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    run_seconds(300);
+    SessionFSM_Stop();
+    CHECK_EQ_U(MockFlash_LastWords()[F_STATE], SESSION_STATE_IDLE, "STOP deja registro IDLE");
+    power_loss_reboot();
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "sesion parada no resucita tras corte");
+    int n = MockFlash_AppendCount();
+    SessionFSM_Stop();
+    CHECK_EQ_U(MockFlash_AppendCount(), n, "STOP sin sesion armada no gasta flash");
+
+    /* Backup valido y flash valida: manda el backup (reloj real) */
+    fresh_boot();
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    run_seconds(3600);
+    MockFlash_LastWordsRaw()[F_ELAPSED] = 10U;   /* flash "atrasada" a proposito */
+    MockRTC_AdvanceSeconds(1800);                 /* corte breve con VBAT */
+    reboot_keep_backup();
+    SessionStatus_t st;
+    SessionFSM_GetStatus(&st);
+    CHECK_EQ_U(st.elapsed_total_s, 3600 + 1800, "con backup valido se usa el reloj, no la flash");
+
+    /* Backup corrupto pero flash valida: se reanuda desde la flash */
+    fresh_boot();
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    run_seconds(2U*3600U);
+    MockBKP_Raw()[W_DURATION_S] ^= 0x1;
+    reboot_keep_backup();
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_ON, "backup corrupto + flash valida -> ON");
+
+    /* Registro de flash imposible -> IDLE */
+    fresh_boot();
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    run_seconds(120);
+    MockFlash_LastWordsRaw()[F_ON_S] = 5U;   /* por debajo del minimo */
+    power_loss_reboot();
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "flash imposible -> IDLE");
+    CHECK(g_spy.ad_allzero_calls > 0, "salida segura");
+
+    /* Tiempo transcurrido >= duracion -> sesion ya terminada -> IDLE */
+    fresh_boot();
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    run_seconds(120);
+    MockFlash_LastWordsRaw()[F_ELAPSED] = 3U*D;
+    power_loss_reboot();
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "sesion ya cumplida -> IDLE");
+
+    /* Fallo de escritura en flash: la sesion sigue */
+    fresh_boot();
+    MockFlash_SetWriteFail(true);
+    CHECK(SessionFSM_Start(6*H, 6*H, 3*D) == HAL_OK, "START aunque falle la flash");
+    run_seconds(180);
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_ON, "sigue en ON con flash fallando");
+    MockFlash_SetWriteFail(false);
+}
+
+static void test_eeprom_maintenance(void)
+{
+    printf("[test] mantenimiento EEPROM solo en IDLE\n");
+    fresh_boot();
+    CHECK(SessionFSM_StoreAmplifierSafeDefault() == HAL_OK, "IDLE: permitido");
+    CHECK_EQ_U(g_spy.ad_eeprom_calls, 2, "graba los dos AD5144");
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    CHECK(SessionFSM_StoreAmplifierSafeDefault() == HAL_BUSY, "con sesion: HAL_BUSY");
+    CHECK_EQ_U(g_spy.ad_eeprom_calls, 2, "con sesion no toca la EEPROM");
+    run_seconds(7U*3600U);
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_REST, "en REST");
+    CHECK(SessionFSM_StoreAmplifierSafeDefault() == HAL_BUSY, "en REST tampoco");
+}
+
+
+/* ================================================================== *
+ *  12. Seguridad de salida
+ * ================================================================== */
+static void test_output_safety(void)
+{
+    printf("[test] seguridad: amplitud 0, fallos de AD5144 y DAC\n");
+
+    /* Amplitud 0 con el pocillo en la mascara -> pocillo a GND */
+    fresh_boot();
+    SessionFSM_SetBankFrequency(DAC_BANK_A, 100000);
+    SessionFSM_SetChannelMillivolts(1, 500);
+    SessionFSM_SetWell(1, true);
+    SessionFSM_SetWell(2, true);              /* canal 2 sin amplitud */
+    CHECK(SessionFSM_Start(6*H, 6*H, 3*D) == HAL_OK, "START aceptado");
+    CHECK_EQ_U(g_spy.sel_well_state & 0x03, 0x01, "pocillo 1 conectado; pocillo 2 (0 mV) a GND");
+
+    SessionFSM_SetChannelMillivolts(2, 300);
+    CHECK_EQ_U(g_spy.sel_well_state & 0x02, 0x02, "al darle amplitud, el pocillo 2 se conecta");
+    SessionFSM_SetChannelMillivolts(1, 0);
+    CHECK_EQ_U(g_spy.sel_well_state & 0x01, 0x00, "al poner 0 mV, el pocillo 1 se desconecta");
+    CHECK_EQ_U(g_spy.ad_setmv_last_mv[0], 0, "y el AD5144 pasa a la posicion de 0 mV");
+    SessionFSM_SetWell(5, true);              /* canal 5 sin amplitud */
+    CHECK_EQ_U(g_spy.sel_well_state & 0x10, 0x00, "SET WELL ON con 0 mV no conecta");
+    SessionStatus_t st;
+    SessionFSM_GetStatus(&st);
+    CHECK_EQ_U(st.well_mask & 0x10, 0x10, "pero la mascara lo recuerda");
+
+    /* Fallo de un AD5144 al entrar en ON: ese pocillo no se conecta */
+    fresh_boot();
+    for (uint8_t c = 1; c <= 8; c++) {
+        SessionFSM_SetChannelMillivolts(c, 400);
+        SessionFSM_SetWell(c, true);
+    }
+    CHECK(SessionFSM_Start(6*H, 6*H, 3*D) == HAL_OK, "START con todo bien");
+    MockRTC_AdvanceSeconds(7*H); SessionFSM_Task();   /* REST */
+    g_spy.ad_fail_mask = 0x04;                         /* canal 3 */
+    MockRTC_AdvanceSeconds(6*H); SessionFSM_Task();   /* ON otra vez */
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_STIM_ON, "la sesion sigue en ON");
+    CHECK_EQ_U(g_spy.sel_well_state, 0xFB, "todos conectados menos el 3 (escritura fallida)");
+    g_spy.ad_fail_mask = 0;
+
+    /* START con fallo de hardware -> cancelada, IDLE, salida segura */
+    fresh_boot();
+    SessionFSM_SetChannelMillivolts(6, 400);
+    SessionFSM_SetWell(6, true);
+    g_spy.ad_fail_mask = 0x20;
+    CHECK(SessionFSM_StartParamsValid(6*H, 6*H, 3*D), "parametros validos");
+    CHECK(SessionFSM_Start(6*H, 6*H, 3*D) != HAL_OK, "START con fallo I2C -> error");
+    CHECK_EQ_U(SessionFSM_GetState(), SESSION_STATE_IDLE, "sesion cancelada");
+    CHECK_EQ_U(g_spy.sel_well_state, 0x00, "ningun pocillo conectado");
+    CHECK_EQ_U(MockBKP_Raw()[W_MAGIC], 0, "sin backup de una sesion que no arranco");
+    CHECK_EQ_U(MockFlash_LastWords()[F_STATE], SESSION_STATE_IDLE, "ni copia en flash activa");
+    g_spy.ad_fail_mask = 0;
+    CHECK(!SessionFSM_StartParamsValid(6*H, 6*H, 3*H), "duracion < tramo ON -> invalido");
+    CHECK(!SessionFSM_StartParamsValid(0, 0, 1*D), "ON = 0 -> invalido");
+
+    /* Consigna en caliente que falla -> se conserva la anterior */
+    fresh_boot();
+    SessionFSM_SetChannelMillivolts(2, 700);
+    SessionFSM_SetWell(2, true);
+    SessionFSM_Start(6*H, 6*H, 3*D);
+    int n = MockFlash_AppendCount();
+    g_spy.ad_fail_mask = 0x02;
+    CHECK(SessionFSM_SetChannelMillivolts(2, 1500) != HAL_OK, "fallo I2C -> error");
+    SessionFSM_GetStatus(&st);
+    CHECK_EQ_U(st.amp_mv[1], 700, "se conserva la consigna anterior");
+    CHECK_EQ_U(MockFlash_AppendCount(), n, "no se persiste una consigna no aplicada");
+    CHECK_EQ_U(g_spy.sel_well_state & 0x02, 0x02, "el pocillo sigue con su amplitud anterior");
+    g_spy.ad_fail_mask = 0;
+
+    /* Frecuencia en caliente que falla -> se conserva la anterior */
+    SessionFSM_SetBankFrequency(DAC_BANK_B, 50000);
+    g_spy.dac_fail = true;
+    CHECK(SessionFSM_SetBankFrequency(DAC_BANK_B, 200000) != HAL_OK, "fallo del DAC -> error");
+    g_spy.dac_fail = false;
+    SessionFSM_GetStatus(&st);
+    CHECK_EQ_U(st.freq_hz[DAC_BANK_B], 50000, "se conserva la frecuencia anterior");
+    CHECK_EQ_U(g_spy.dac_setfreq_last[DAC_BANK_B], 50000, "y se reaplica en el DAC");
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -418,6 +703,11 @@ int main(void)
     test_recover_bad_magic();
     test_recover_implausible_params();
     test_recover_clock_backwards();
+    test_flash_checkpoints();
+    test_flash_power_loss();
+    test_flash_stop_and_priority();
+    test_eeprom_maintenance();
+    test_output_safety();
 
     printf("\n=== %d comprobaciones, %d fallos ===\n", g_checks, g_fail);
     if (g_fail == 0) { printf("RESULTADO: OK\n"); return 0; }

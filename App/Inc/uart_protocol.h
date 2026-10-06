@@ -17,7 +17,9 @@
  *   ERR RANGE    argumento numerico fuera del rango permitido. Requisito de
  *                seguridad del proyecto: no se recorta ni se aplica a medias.
  *   ERR HW       el valor era valido pero el periferico fallo al aplicarlo
- *                (fallo de bus I2C con el AD5144, etc.).
+ *                (fallo de bus I2C con el AD5144, escritura de flash, etc.).
+ *   ERR STATE    la orden no se permite en el estado actual (p. ej. una
+ *                operacion de mantenimiento con una sesion en marcha).
  *
  * Comandos (ver capitulo de Requisitos de diseno de la memoria):
  *
@@ -27,6 +29,31 @@
  *   START <horas_on> <horas_off> <dias>     arma y arranca la sesion
  *   STOP                                    para todo, 0 V, FSM a IDLE
  *   STATUS                                  vuelca estado + parametros
+ *
+ * Calibracion de la medida de corriente (ver current_calc.h). Los decimales
+ * usan punto; hasta 6 cifras decimales:
+ *
+ *   SET CAL <canal 1-8> <ganancia> <offset_uA>   ganancia en (0, 10],
+ *                                                offset en +/-2000 uA
+ *   SET VREF <mV 1-3600>                         VREF real de la placa
+ *   GET CAL <canal 1-8>                          linea de datos + OK:
+ *       CAL CH=<n> GAIN=<g> OFFSET_UA=<o> VREF_MV=<v>
+ *   SAVE CAL                                     guarda VREF y los 8 canales
+ *                                                en flash (persisten)
+ *
+ * Medida de corriente (ver sd_logger.h):
+ *
+ *   GET CUR          linea de datos + OK:
+ *       CUR LOG=<OFF|ON|NOSD> FILE=<BNNNN.BIN|-> REC=<n> UA=<v1>,...,<v8>
+ *     con el valor de cada canal del ultimo segundo en uA (3 decimales, NAN
+ *     si no hay medida). LOG=NOSD: se mide pero no hay tarjeta o fallo la
+ *     escritura.
+ *
+ * Mantenimiento (solo en IDLE):
+ *
+ *   EEPROM SAFE      graba el codigo de ganancia minima en la EEPROM de los
+ *                    dos AD5144 (arranque seguro al encender). Gasta ciclos
+ *                    de EEPROM: usar una vez por placa, no de forma rutinaria.
  *
  * Respuesta de STATUS (linea de datos antes del OK\n):
  *

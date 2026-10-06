@@ -11,13 +11,13 @@
  * (DAC_RTC_L4), aqui generalizado a frecuencia configurable en lugar de
  * fija a 100 Hz.
  *
- * El DAC fija el TECHO de amplitud: siempre oscila a fondo de escala
- * (DAC_CODE_LOW <-> DAC_CODE_HIGH). La amplitud INDIVIDUAL de cada uno de
- * los 8 canales la ajusta despues el AD5144 (ver ad5144.h), que atenua
- * esta misma onda ya oscilante -- un divisor resistivo no distingue entre
- * continua y alterna, asi que atenua igual de bien una onda cuadrada que
- * un nivel fijo. Este driver NO conoce ni gestiona la amplitud por canal,
- * solo la frecuencia y el techo compartido del banco.
+ * El DAC fija la amplitud de ENTRADA comun del banco: oscila siempre
+ * entre DAC_CODE_LOW y DAC_CODE_HIGH, simetrico respecto a VBIAS. La
+ * amplitud INDIVIDUAL de cada uno de los 8 canales la fija despues el
+ * AD5144 como reostato en la realimentacion de un inversor (ver
+ * ad5144.h), que amplifica esa misma onda con ganancia R_AW/2,5 kOhm.
+ * Este driver NO conoce ni gestiona la amplitud por canal, solo la
+ * frecuencia, la excursion compartida del banco y el aparcado en VBIAS.
  *
  * TIM1 dispara la conversion del banco A, TIM8 dispara la del banco B
  * (misma pareja de timers que ya usaba el prototipo antiguo, en modo
@@ -55,18 +55,39 @@ typedef enum {
 #define DAC_FREQ_MIN_HZ        (1UL)
 #define DAC_FREQ_MAX_HZ        (300000UL)
 
-/* Codigos de 12 bits que definen el techo de amplitud (fondo de escala
- * compartido por el banco). Punto de partida: los valores que ya usaba
- * el prototipo antiguo (empiricamente probados en continua), pendientes
- * de recalibrar contra la placa real una vez montada -- dependen de la
- * ganancia exacta de la etapa diferencial de ESA y de VBIAS. */
-#define DAC_CODE_HIGH          (2630U)
-#define DAC_CODE_LOW           (1430U)
+/* Codigos de 12 bits de la onda (revision de esquematicos de octubre de
+ * 2026). La etapa diferencial de ESA (OPA2172 + LT5400-4, 4 x 1 kOhm,
+ * relacion 1:1) entrega Dif = VBIAS - DAC_OUT, y VBIAS = VREF/2 sale del
+ * mismo REF19xx que alimenta VREF+. Por tanto el codigo que da Dif = 0 es
+ * exactamente la mitad de escala, sea cual sea el valor real de VREF
+ * (diseno ratiometrico): DAC_CODE_MID = 2048.
+ *
+ * La excursion +/-DAC_SWING_CODES fija la amplitud de pico de Dif que
+ * despues amplifica cada canal (ganancia R_AW/2,5 kOhm, ver ad5144.h):
+ *   - techo: con D = 0 y R_AB en +8 % (ganancia 4,37) la salida no debe
+ *     pasar de los +/-2,5 V que admiten los terminales del AD5144
+ *     -> excursion <= 0,572 V (710 codigos).
+ *   - suelo: con R_AB en -8 % (ganancia max. 3,70) aun deben alcanzarse
+ *     2 V de pico -> excursion >= 0,540 V (671 codigos).
+ * 690 codigos (0,556 V con VREF = 3,3 V) cumple ambos; resolucion por
+ * canal ~8,7 mV/paso, por debajo de los 10 mV pedidos.
+ * Pendiente de confirmar: si los "0-2 V" del requisito son de pico (lo que
+ * aqui se asume) o pico a pico. */
+#define DAC_VREF_MV            (3300U)
+#define DAC_CODE_MID           (2048U)
+#define DAC_SWING_CODES        (690U)
+#define DAC_CODE_HIGH          (DAC_CODE_MID + DAC_SWING_CODES)
+#define DAC_CODE_LOW           (DAC_CODE_MID - DAC_SWING_CODES)
+
+/* Amplitud de pico de Dif en mV (redondeada) para la conversion
+ * mV -> codigo del AD5144: 690 * 3300 / 4096 = 555,9 -> 556 mV. */
+#define DAC_DIF_PEAK_MV        ((uint16_t)(((uint32_t)DAC_SWING_CODES * DAC_VREF_MV + 2048U) / 4096U))
 
 /**
  * @brief  Vincula los handles de DAC/timer generados por CubeMX, prepara
  *         el buffer circular de 2 muestras por banco y deja ambos bancos
- *         detenidos (0 Hz) hasta que se pida una frecuencia explicita.
+ *         detenidos (0 Hz) y APARCADOS en DAC_CODE_MID (Dif = 0) hasta que
+ *         se pida una frecuencia explicita.
  */
 HAL_StatusTypeDef DacWaveform_Init(DAC_HandleTypeDef *hdac,
                                     TIM_HandleTypeDef *htim_bank_a,
@@ -81,10 +102,12 @@ HAL_StatusTypeDef DacWaveform_Init(DAC_HandleTypeDef *hdac,
 HAL_StatusTypeDef DacWaveform_SetFrequency(DacBank_t bank, uint32_t freq_hz);
 
 /**
- * @brief  Detiene el banco (DAC y timer de disparo). Medida de defensa en
- *         profundidad: la seguridad primaria de "canal a 0 V" la da el
- *         AD5144 a codigo 0, no este detenimiento -- pero parar el DAC
- *         cuando el banco entero esta inactivo ahorra consumo.
+ * @brief  Detiene la onda del banco (timer de disparo y DMA) y deja la
+ *         salida del DAC APARCADA en DAC_CODE_MID, es decir, Dif = 0 y
+ *         salida de los cuatro canales del banco a 0 V sea cual sea el
+ *         codigo del AD5144. No se deshabilita el canal: con el DAC
+ *         deshabilitado el pin queda en alta impedancia y la etapa
+ *         diferencial entregaria una continua de -VBIAS/2 a los pocillos.
  */
 HAL_StatusTypeDef DacWaveform_Stop(DacBank_t bank);
 

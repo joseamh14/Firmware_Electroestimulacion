@@ -27,6 +27,15 @@
  * ON/REST deberia estar AHORA (a partir del calendario del RTC) y reanuda
  * ahi -- se autocorrige aunque el corte haya durado varios tramos.
  *
+ * COPIA EN FLASH (revision de esquematicos de octubre de 2026): en esta
+ * placa VBAT esta unido a VDD, asi que un corte de alimentacion borra los
+ * registros de backup y reinicia el calendario. La sesion se guarda tambien
+ * en la flash interna (flash_log.h) con el tiempo de sesion transcurrido y
+ * un punto de control por minuto. Si al arrancar el backup del RTC no es
+ * valido, se reanuda desde esa copia: se pierde como mucho un minuto y el
+ * tiempo sin alimentacion no cuenta. El backup del RTC sigue siendo la
+ * fuente preferente (reset por IWDG, o VBAT con pila si se anade).
+ *
  * REQUISITO DE INTEGRACION: MX_RTC_Init() genera por defecto una escritura
  * incondicional de hora/fecha en cada arranque, lo que reiniciaria el
  * calendario y romperia el calculo de tiempo transcurrido. Esa escritura
@@ -68,11 +77,11 @@ extern "C" {
 #define SESSION_AMP_MAX_MV              (2000U)
 #define SESSION_AMP_STEP_MV             (10U)
 
-/* Tension que corresponde al codigo 255 del AD5144 (fondo de escala de la
- * cadena de atenuacion). Punto de partida = SESSION_AMP_MAX_MV; pendiente
- * de recalibrar contra la placa real, igual que los DAC_CODE_* de
- * dac_waveform.h -- depende de la ganancia exacta de la etapa ESA. */
-#define SESSION_CHANNEL_FULL_SCALE_MV  (2000U)
+/* Amplitud de pico de la senal diferencial Dif que recibe cada canal a la
+ * entrada del inversor de ESA. La fija la excursion del DAC del banco
+ * (DAC_DIF_PEAK_MV, ver dac_waveform.h) y es la referencia con la que el
+ * AD5144 convierte la consigna en mV a codigo de wiper (ver ad5144.h). */
+#define SESSION_CHANNEL_IN_PEAK_MV     (DAC_DIF_PEAK_MV)
 
 /* Limites del comando START. horas_on y dias son obligatorios (>=1);
  * horas_off puede ser 0 (estimulacion continua sin tramos de reposo). */
@@ -128,10 +137,20 @@ HAL_StatusTypeDef SessionFSM_Init(RTC_HandleTypeDef *hrtc,
                                   AD5144_Handle_t *ad_bank_b);
 
 /**
+ * @brief  Comprueba los parametros de START sin tocar nada (para que el
+ *         parser distinga un error de rango de un fallo de hardware).
+ */
+bool SessionFSM_StartParamsValid(uint32_t on_seconds,
+                                 uint32_t off_seconds,
+                                 uint32_t duration_seconds);
+
+/**
  * @brief  Arma y arranca una sesion. Los tres tiempos van en SEGUNDOS: la
  *         conversion desde las horas/dias del comando START es tarea del
- *         parser. Fuera de rango (o duracion menor que un tramo ON) devuelve
- *         HAL_ERROR sin tocar el estado anterior.
+ *         parser. Parametros invalidos -> HAL_ERROR sin tocar el estado
+ *         anterior (ver SessionFSM_StartParamsValid). Si el hardware falla
+ *         al aplicar las salidas, la sesion se cancela con apagado seguro y
+ *         se devuelve el estado de error del periferico.
  * @param  on_seconds       Duracion del tramo de estimulacion.
  * @param  off_seconds      Duracion del tramo de reposo (0 = sin reposo).
  * @param  duration_seconds Duracion total de la sesion.
@@ -157,7 +176,10 @@ void SessionFSM_Task(void);
  * @brief  Fija la consigna de amplitud de un canal (1..8) en milivoltios.
  *         Se aplica al instante si la FSM esta en STIM_ON; en cualquier otro
  *         estado se guarda y se aplicara al entrar en el siguiente STIM_ON.
- *         target_mv > SESSION_AMP_MAX_MV -> HAL_ERROR.
+ *         target_mv > SESSION_AMP_MAX_MV -> HAL_ERROR. Si la escritura en el
+ *         AD5144 falla, se conserva la consigna anterior y se devuelve el
+ *         error. Con 0 mV el pocillo se lleva a GND aunque este en la
+ *         mascara (el AD5144 no llega a 0 V por si solo).
  */
 HAL_StatusTypeDef SessionFSM_SetChannelMillivolts(uint8_t channel, uint16_t target_mv);
 
@@ -170,9 +192,18 @@ HAL_StatusTypeDef SessionFSM_SetBankFrequency(DacBank_t bank, uint32_t freq_hz);
 
 /**
  * @brief  Conecta/desconecta un pocillo (1..8) de la senal. Mismo criterio
- *         de aplicacion diferida.
+ *         de aplicacion diferida. En STIM_ON un pocillo de la mascara solo
+ *         se conecta si su canal tiene amplitud > 0 aplicada en el AD5144.
  */
 HAL_StatusTypeDef SessionFSM_SetWell(uint8_t channel, bool connected);
+
+/**
+ * @brief  Mantenimiento: graba en la EEPROM de los dos AD5144 el codigo de
+ *         ganancia minima, para que arranquen en posicion segura al
+ *         encenderse. Solo se permite en IDLE (HAL_BUSY en otro estado).
+ *         Tarda unos 0,1-0,4 s.
+ */
+HAL_StatusTypeDef SessionFSM_StoreAmplifierSafeDefault(void);
 
 /**
  * @brief  Estado actual de la FSM.
