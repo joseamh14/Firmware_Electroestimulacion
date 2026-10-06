@@ -1,8 +1,9 @@
-# Arnés de pruebas de escritorio — `dac_waveform` (cálculo PSC/ARR)
+# Arnés de pruebas de escritorio — `dac_waveform`
 
-Valida la aritmética que convierte una frecuencia objetivo en el par
-`(prescaler, autorreload)` del temporizador de disparo del DAC, **sin
-hardware ni STM32CubeIDE**.
+Valida, **sin hardware ni STM32CubeIDE**, la aritmética que convierte una
+frecuencia objetivo en el par `(prescaler, autorreload)` del temporizador
+de disparo del DAC y el aparcado de cada canal en VBIAS (código 2048)
+cuando su banco no está generando onda.
 
 La función bajo prueba es `ComputeTimerParams()` de
 `BSP/Src/dac_waveform.c`: aritmética pura, no toca ningún registro. Como
@@ -28,7 +29,7 @@ Compilador por defecto: **LCC-win64** (incluido con MATLAB). Override:
 LCC_ROOT="/c/ruta/a/lcc64/lcc64" bash test/dac_waveform/build_and_run.sh
 ```
 
-Salida esperada: `=== N comprobaciones, 0 fallos ===` / `RESULTADO: OK`
+Salida esperada: `=== 73 comprobaciones, 0 fallos ===` / `RESULTADO: OK`
 (código de salida 0).
 
 ## Qué se cubre
@@ -43,6 +44,8 @@ Salida esperada: `=== N comprobaciones, 0 fallos ===` / `RESULTADO: OK`
 | Barrido de banda 1 Hz–300 kHz | nunca rechaza · ARR/PSC siempre ≤ 0xFFFF (sin desbordamiento silencioso) · error < 6000 ppm (peor caso ≈ 4998 ppm cerca de 300 kHz, resolución ARR≈200) |
 | Barrido por décadas | 10/100/1k/10k Hz: error ≤ 10 ppm (peor: 10 Hz ≈ 6 ppm; los demás exactos) |
 | API público | `(PSC,ARR)` llega al timer · `CNT` a 0 en cada reconfiguración · `GetFrequency` coherente · banco inválido → `HAL_ERROR` · 0 Hz para el banco · fallo de `HAL_DAC_Start_DMA` se propaga y el banco no queda activo |
+| Onda centrada en VBIAS | `DAC_CODE_MID` = 2048 · excursión ±690 códigos simétrica · `DAC_DIF_PEAK_MV` = 556 mV |
+| Aparcado del canal | tras `Init`, `Stop`, 0 Hz y fallo de DMA: DAC habilitado, `TENx` = 0 y DHR = 2048 (salida diferencial nula, nunca flotante) · al arrancar la onda `TENx` vuelve a estar activo antes de `HAL_DAC_Start_DMA` · buffer DMA de 2 muestras HIGH/LOW · el otro banco no se ve afectado |
 
 ## Nota sobre el límite superior
 
@@ -57,10 +60,13 @@ registro de 16 bits del `ARR`. Queda anotado en el propio test.
 ## Archivos
 
 - `mock_hal.h` / `stm32l4xx_hal.h` — HAL mínima: `HAL_StatusTypeDef`,
-  handles de TIM (con `PSC`/`ARR`/`CNT` observables) y DAC, macros
-  `__HAL_TIM_SET_*`, constantes `DAC_CHANNEL_*`.
-- `mocks.c` — stubs no-op de `HAL_TIM_Base_*` y `HAL_DAC_*_DMA` (+ espía de
-  llamadas y retorno forzable de `HAL_DAC_Start_DMA`).
+  handles de TIM (con `PSC`/`ARR`/`CNT` observables) y DAC (con registro
+  `CR` y bits `TEN1`/`TEN2`), macros `__HAL_TIM_SET_*`, `SET_BIT`/
+  `CLEAR_BIT`, constantes `DAC_CHANNEL_*`.
+- `mocks.c` — modelo del estado de cada canal del DAC (habilitado, DMA
+  activo, DHR, `TENx` en el momento de arrancar el DMA, buffer y longitud)
+  y stubs de `HAL_TIM_Base_*`, `HAL_DAC_Start`, `HAL_DAC_SetValue` y
+  `HAL_DAC_*_DMA` (+ retorno forzable de `HAL_DAC_Start_DMA`).
 - `test_dac_waveform.c` — incluye `dac_waveform.c`, casos de prueba +
   mini-framework de asserts.
 - `build_and_run.sh` — compila y ejecuta.

@@ -23,7 +23,11 @@
  *   5. Una linea mas larga que UART_LINE_MAX no desborda el buffer ni
  *      corrompe el siguiente comando.
  *   6. Un fallo simulado de session_fsm (mock -> HAL_ERROR) se traduce en
- *      ERR HW (ERR RANGE en el caso de START, por diseno) y nunca en OK.
+ *      ERR HW y nunca en OK; en START, los parametros incoherentes dan
+ *      ERR RANGE (sin llamar a la FSM) y el fallo al aplicar, ERR HW.
+ *   7. Calibracion (SET CAL, SET VREF, GET CAL, SAVE CAL), medida (GET CUR)
+ *      y mantenimiento (EEPROM SAFE): formato de las respuestas, decimales
+ *      sin printf de coma flotante, limites y errores.
  ******************************************************************************
  */
 #include "mock_hal.h"
@@ -33,6 +37,7 @@
 #include "uart_protocol.h"
 #include "session_fsm.h"
 #include "dac_waveform.h"
+#include "current_calc.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -69,6 +74,8 @@ static int g_fail;
 static void reset_all(void)
 {
     FsmSpy_Reset();
+    LogSpy_Reset();
+    CurrentCalc_Init();
     TxSpy_Reset();
     MockUsb_SetConfigured(true);
     UartProtocol_Init();
@@ -204,6 +211,7 @@ static void test_range_errors(void)
         "START 200 6 3\n",     /* horas_on > 168                     */
         "START 6 200 3\n",     /* horas_off > 168                    */
         "START 6 6 400\n",     /* dias > 365                         */
+        "START 48 6 1\n",      /* duracion (1 dia) < tramo ON (48 h) */
     };
 
     for (size_t i = 0U; i < sizeof(bad) / sizeof(bad[0]); i++) {
@@ -327,7 +335,7 @@ static void test_line_overflow(void)
  * ================================================================== */
 static void test_fsm_failure(void)
 {
-    printf("[test] fallo simulado de session_fsm -> ERR HW (RANGE en START), nunca OK\n");
+    printf("[test] fallo simulado de session_fsm -> ERR HW, nunca OK\n");
 
     reset_all(); g_fsm.ret = HAL_ERROR;
     feed("SET AMP 3 500\n");
@@ -346,12 +354,12 @@ static void test_fsm_failure(void)
     feed("STOP\n");
     CHECK_TX("ERR HW\n", "fallo FSM en STOP -> ERR HW");
 
-    /* HandleStart mapea un fallo tardio de SessionFSM_Start a ERR RANGE
-     * (la combinacion de tiempos puede ser incoherente); ver el comentario
-     * en uart_protocol.c. Lo importante: NO devuelve OK. */
+    /* Parametros validos y fallo al aplicar (bus I2C, DAC): ERR HW. Los
+     * parametros incoherentes se rechazan antes con ERR RANGE (ver
+     * test_range_errors, caso "START 48 6 1"). */
     reset_all(); g_fsm.ret = HAL_ERROR;
     feed("START 6 6 3\n");
-    CHECK_TX("ERR RANGE\n", "fallo de SessionFSM_Start -> ERR RANGE (no OK)");
+    CHECK_TX("ERR HW\n", "fallo de SessionFSM_Start -> ERR HW (no OK)");
     CHECK_EQ_U(g_fsm.start_calls, 1, "START si invoco a la FSM");
 }
 
@@ -369,6 +377,82 @@ static void test_usb_not_ready(void)
     CHECK_EQ_U(g_tx.calls, 0,         "respuesta descartada si pClassData == NULL");
 }
 
+
+/* ================================================================== *
+ *  7. Calibracion, medida y mantenimiento
+ * ================================================================== */
+static void expect(const char *line, const char *resp)
+{
+    TxSpy_Reset();
+    feed(line);
+    CHECK_TX(resp, line);
+}
+
+static void test_calibration(void)
+{
+    printf("[test] SET/GET/SAVE CAL y SET VREF\n");
+    reset_all();
+    expect("GET CAL 1\n", "CAL CH=1 GAIN=1.000000 OFFSET_UA=0.000 VREF_MV=3300\nOK\n");
+    expect("SET CAL 3 1.0234 -5.2\n", "OK\n");
+    expect("get cal 3\n", "CAL CH=3 GAIN=1.023400 OFFSET_UA=-5.200 VREF_MV=3300\nOK\n");
+    expect("SET CAL 3 0.5 +12.125\n", "OK\n");
+    expect("GET CAL 3\n", "CAL CH=3 GAIN=0.500000 OFFSET_UA=12.125 VREF_MV=3300\nOK\n");
+
+    const char *range[] = {
+        "SET CAL 9 1 0\n", "SET CAL 0 1 0\n", "SET CAL 1 0 0\n", "SET CAL 1 10.5 0\n",
+        "SET CAL 1 1 2000.5\n", "SET CAL 1 -1 0\n", "SET VREF 0\n", "SET VREF 3601\n",
+        "SET VREF 99999999\n", "GET CAL 9\n",
+    };
+    for (size_t i = 0; i < sizeof(range) / sizeof(range[0]); i++) {
+        expect(range[i], "ERR RANGE\n");
+    }
+    const char *syntax[] = {
+        "SET CAL 1 1,5 0\n", "SET CAL 1 1.2.3 0\n", "SET CAL 1 . 0\n",
+        "SET CAL 1 1.1234567 0\n", "SET CAL 1 abc 0\n", "SET CAL 1 1\n",
+        "SET CAL 1 1 0 9\n", "GET CAL\n", "GET FOO 1\n", "SAVE\n", "SAVE FOO\n",
+    };
+    for (size_t i = 0; i < sizeof(syntax) / sizeof(syntax[0]); i++) {
+        expect(syntax[i], "ERR SYNTAX\n");
+    }
+    expect("GET CAL 1\n", "CAL CH=1 GAIN=1.000000 OFFSET_UA=0.000 VREF_MV=3300\nOK\n");
+
+    expect("SET VREF 3000\n", "OK\n");
+    expect("GET CAL 2\n", "CAL CH=2 GAIN=1.000000 OFFSET_UA=0.000 VREF_MV=3000\nOK\n");
+
+    expect("SAVE CAL\n", "OK\n");
+    CHECK_EQ_U(g_flash_appends, 1, "SAVE CAL escribe un registro en flash");
+    g_flash_ret = HAL_ERROR;
+    expect("SAVE CAL\n", "ERR HW\n");
+    CHECK_EQ_U(g_fsm.mutations, 0, "la calibracion no toca la sesion");
+}
+
+static void test_current_and_eeprom(void)
+{
+    printf("[test] GET CUR y EEPROM SAFE\n");
+    reset_all();
+    expect("GET CUR\n", "CUR LOG=OFF FILE=- REC=0 UA=NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN\nOK\n");
+    g_log.state = SD_LOG_ACTIVE;
+    strcpy(g_log.file, "B0003.BIN");
+    g_log.records = 42;
+    g_log.have_values = true;
+    g_log.last_ua[0] = 999.97f; g_log.last_ua[1] = -0.5f; g_log.last_ua[2] = 0.0f;
+    expect("get cur\n", "CUR LOG=ON FILE=B0003.BIN REC=42 UA=999.970,-0.500,0.000,NAN,NAN,NAN,NAN,NAN\nOK\n");
+    g_log.state = SD_LOG_NO_CARD; g_log.file[0] = '\0';
+    expect("GET CUR\n", "CUR LOG=NOSD FILE=- REC=42 UA=999.970,-0.500,0.000,NAN,NAN,NAN,NAN,NAN\nOK\n");
+    expect("GET CUR 1\n", "ERR SYNTAX\n");
+
+    expect("EEPROM SAFE\n", "OK\n");
+    CHECK_EQ_U(g_fsm.eeprom_calls, 1, "EEPROM SAFE llama a la FSM");
+    g_fsm.eeprom_ret = HAL_BUSY;
+    expect("EEPROM SAFE\n", "ERR STATE\n");
+    g_fsm.eeprom_ret = HAL_TIMEOUT;
+    expect("eeprom safe\n", "ERR HW\n");
+    int calls = g_fsm.eeprom_calls;
+    expect("EEPROM\n", "ERR SYNTAX\n");
+    expect("EEPROM FOO\n", "ERR SYNTAX\n");
+    CHECK_EQ_U(g_fsm.eeprom_calls, calls, "sintaxis incorrecta no toca la EEPROM");
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -381,6 +465,8 @@ int main(void)
     test_line_overflow();
     test_fsm_failure();
     test_usb_not_ready();
+    test_calibration();
+    test_current_and_eeprom();
 
     printf("\n=== %d comprobaciones, %d fallos ===\n", g_checks, g_fail);
     if (g_fail == 0) { printf("RESULTADO: OK\n"); return 0; }

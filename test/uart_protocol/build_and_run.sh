@@ -3,8 +3,10 @@
 # Compila y ejecuta el arnes de pruebas de escritorio de uart_protocol.
 #
 # No necesita el target ni STM32CubeIDE: compila el parser real
-# (../../App/Src/uart_protocol.c) contra los mocks de este directorio
-# (espia de CDC_Transmit_FS + mocks de session_fsm) y ejecuta el binario.
+# (../../App/Src/uart_protocol.c) y la conversion de corriente real
+# (../../BSP/Src/current_calc.c) contra los mocks de este directorio
+# (espia de CDC_Transmit_FS, mocks de session_fsm, del registrador y de la
+# flash) y ejecuta el binario.
 #
 # Compilador por defecto: LCC-win64, incluido con MATLAB
 #   (<MATLABROOT>/sys/lcc64/lcc64). Ajusta LCC_ROOT si tu ruta difiere.
@@ -27,6 +29,7 @@ I_LCC="$(w "$LCC_ROOT/include64")"
 L_LCC="$(w "$LCC_ROOT/lib64")"
 
 UART_SRC="$(w "$(cd ../../App/Src && pwd)/uart_protocol.c")"
+CALC_SRC="$(w "$(cd ../../BSP/Src && pwd)/current_calc.c")"
 MOCKS_SRC="$(w "$HERE/mocks.c")"
 TEST_SRC="$(w "$HERE/test_uart_protocol.c")"
 
@@ -40,13 +43,13 @@ INCS=(-I"$I_TEST" -I"$I_APP" -I"$I_BSP" -I"$I_LCC")
 
 echo "--- compilando ---"
 ( cd "$OUT_DIR"
-  for src in "$UART_SRC" "$MOCKS_SRC" "$TEST_SRC"; do
+  for src in "$UART_SRC" "$CALC_SRC" "$MOCKS_SRC" "$TEST_SRC"; do
       echo "  $src"
       "$LCC64" "${INCS[@]}" -c "$src" < /dev/null
   done
   echo "--- enlazando ---"
   "$LCCLNK64" -L"$L_LCC" -o test_uart_protocol.exe \
-      uart_protocol.obj mocks.obj test_uart_protocol.obj
+      uart_protocol.obj current_calc.obj mocks.obj test_uart_protocol.obj
 )
 
 echo "--- ejecutando ---"

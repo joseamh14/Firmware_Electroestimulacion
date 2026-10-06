@@ -34,6 +34,11 @@
  *   6. Via API publico DacWaveform_SetFrequency: el par (PSC, ARR) llega al
  *      timer, el limite superior se rechaza sin tocar el estado anterior,
  *      0 Hz para el banco y un fallo de DMA se propaga.
+ *   7. Onda centrada en VBIAS y aparcado (revision de esquematicos de
+ *      octubre de 2026): codigos 2048 +/- 690, amplitud de Dif de 556 mV;
+ *      Init, Stop, 0 Hz y un fallo de DMA dejan el canal HABILITADO en 2048
+ *      con el disparo por TRGO desactivado (nunca flotante), y al arrancar
+ *      la onda el disparo vuelve a estar activo.
  ******************************************************************************
  */
 #include "mock_hal.h"
@@ -225,13 +230,15 @@ static void test_decade_error(void)
 /* ================================================================== *
  *  6. Via API publico: PSC/ARR reales en el "registro" del timer
  * ================================================================== */
-static DAC_HandleTypeDef s_hdac_stub;
+static DAC_TypeDef       s_dac_regs;
+static DAC_HandleTypeDef s_hdac_stub = { &s_dac_regs };
 static TIM_HandleTypeDef s_htimA;
 static TIM_HandleTypeDef s_htimB;
 
 static void dac_setup(void)
 {
     DacHalSpy_Reset();
+    s_dac_regs.CR = DAC_CR_TEN1 | (DAC_CR_TEN1 << 16);   /* como tras MX_DAC1_Init */
     s_htimA.PSC = s_htimA.ARR = s_htimA.CNT = 0xFFFFFFFFU;
     s_htimB.PSC = s_htimB.ARR = s_htimB.CNT = 0xFFFFFFFFU;
     CHECK(DacWaveform_Init(&s_hdac_stub, &s_htimA, &s_htimB) == HAL_OK, "DacWaveform_Init -> HAL_OK");
@@ -279,6 +286,51 @@ static void test_public_api(void)
     CHECK_EQ_U(DacWaveform_GetFrequency(DAC_BANK_A), 0U, "tras fallo de DMA el banco no cuenta como activo");
 }
 
+
+/* ================================================================== *
+ *  7. Onda centrada en VBIAS y aparcado del canal
+ * ================================================================== */
+static bool parked(int i)
+{
+    uint32_t ten = DAC_CR_TEN1 << (i == 0 ? 0 : 16);
+    return g_hal.en[i] && !g_hal.dma[i] && g_hal.dhr[i] == DAC_CODE_MID &&
+           (s_dac_regs.CR & ten) == 0U;
+}
+
+static void test_parking(void)
+{
+    printf("[test] onda centrada en VBIAS y aparcado del canal\n");
+
+    CHECK_EQ_U(DAC_CODE_MID, 2048U, "VBIAS = mitad de escala (ratiometrico)");
+    CHECK_EQ_U(DAC_CODE_HIGH - DAC_CODE_MID, 690U, "excursion positiva 690 codigos");
+    CHECK_EQ_U(DAC_CODE_MID - DAC_CODE_LOW, 690U, "excursion negativa simetrica");
+    CHECK_EQ_U(DAC_DIF_PEAK_MV, 556U, "690 * 3300 / 4096 = 556 mV de pico en Dif");
+
+    dac_setup();
+    CHECK(parked(0) && parked(1), "Init: ambos canales aparcados en 2048, habilitados, sin TRGO");
+
+    CHECK(DacWaveform_SetFrequency(DAC_BANK_A, 100000U) == HAL_OK, "arranca banco A");
+    CHECK(g_hal.ten_at_start_dma[0], "al arrancar la onda, TEN1 vuelve a estar activo");
+    CHECK(g_hal.dma[0] && g_hal.en[0], "banco A en marcha por DMA");
+    CHECK(g_hal.dma_len[0] == 2U && g_hal.dma_buf[0][0] == DAC_CODE_HIGH &&
+          g_hal.dma_buf[0][1] == DAC_CODE_LOW, "buffer de 2 muestras HIGH/LOW");
+    CHECK(parked(1), "el banco B sigue aparcado");
+
+    CHECK(DacWaveform_Stop(DAC_BANK_A) == HAL_OK, "Stop banco A");
+    CHECK(parked(0), "Stop: aparcado en 2048 (no deshabilitado)");
+    CHECK_EQ_U(g_hal.tim_stop_calls > 0, 1, "timer parado");
+
+    CHECK(DacWaveform_SetFrequency(DAC_BANK_B, 1000U) == HAL_OK, "arranca banco B");
+    CHECK(g_hal.ten_at_start_dma[1], "TEN2 activo al arrancar el banco B");
+    CHECK(DacWaveform_SetFrequency(DAC_BANK_B, 0U) == HAL_OK, "0 Hz en banco B");
+    CHECK(parked(1), "0 Hz: aparcado en 2048");
+
+    dac_setup();
+    g_hal.dac_start_dma_ret = HAL_ERROR;
+    CHECK(DacWaveform_SetFrequency(DAC_BANK_A, 100000U) == HAL_ERROR, "fallo de DMA");
+    CHECK(parked(0), "tras un fallo de DMA el canal no queda flotante: aparcado");
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -289,6 +341,7 @@ int main(void)
     test_band_sweep();
     test_decade_error();
     test_public_api();
+    test_parking();
 
     printf("\n=== %d comprobaciones, %d fallos ===\n", g_checks, g_fail);
     if (g_fail == 0) { printf("RESULTADO: OK\n"); return 0; }

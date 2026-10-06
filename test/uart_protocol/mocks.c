@@ -15,6 +15,7 @@
 #include "usbd_cdc_if.h"
 #include "session_fsm.h"
 #include "fsm_spy.h"
+#include "flash_log.h"
 
 #include <string.h>
 
@@ -62,6 +63,67 @@ void FsmSpy_Reset(void)
 {
     memset(&g_fsm, 0, sizeof(g_fsm));
     g_fsm.ret = HAL_OK;
+    g_fsm.eeprom_ret = HAL_OK;
+}
+
+/* Misma regla que session_fsm.c: el parser la usa para separar ERR RANGE
+ * (parametros) de ERR HW (fallo al aplicar). No cuenta como mutacion. */
+bool SessionFSM_StartParamsValid(uint32_t on_seconds, uint32_t off_seconds,
+                                 uint32_t duration_seconds)
+{
+    return on_seconds >= SESSION_ON_SECONDS_MIN && on_seconds <= SESSION_ON_SECONDS_MAX &&
+           off_seconds <= SESSION_OFF_SECONDS_MAX &&
+           duration_seconds >= SESSION_DURATION_SECONDS_MIN &&
+           duration_seconds <= SESSION_DURATION_SECONDS_MAX &&
+           duration_seconds >= on_seconds;
+}
+
+HAL_StatusTypeDef SessionFSM_StoreAmplifierSafeDefault(void)
+{
+    g_fsm.mutations++;
+    g_fsm.eeprom_calls++;
+    return g_fsm.eeprom_ret;
+}
+
+/* ===================================================================== *
+ *  Registrador de corriente y flash simulados
+ * ===================================================================== */
+SdLogStatus_t     g_log;
+HAL_StatusTypeDef g_flash_ret;
+int               g_flash_appends;
+
+static float NaNf(void)
+{
+    const uint32_t bits = 0x7FC00000UL;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+void LogSpy_Reset(void)
+{
+    memset(&g_log, 0, sizeof(g_log));
+    g_log.state = SD_LOG_OFF;
+    for (int i = 0; i < 8; i++) g_log.last_ua[i] = NaNf();
+    g_flash_ret = HAL_OK;
+    g_flash_appends = 0;
+}
+
+void SdLogger_GetStatus(SdLogStatus_t *out) { *out = g_log; }
+
+HAL_StatusTypeDef FlashLog_ReadLatest(const FlashLog_Config_t *cfg, void *payload,
+                                      uint32_t payload_len, uint32_t *out_seq)
+{
+    (void)cfg; (void)payload; (void)payload_len; (void)out_seq;
+    return HAL_ERROR;
+}
+
+HAL_StatusTypeDef FlashLog_Append(const FlashLog_Config_t *cfg, const void *payload,
+                                  uint32_t payload_len)
+{
+    (void)cfg; (void)payload; (void)payload_len;
+    g_flash_appends++;
+    return g_flash_ret;
 }
 
 HAL_StatusTypeDef SessionFSM_SetChannelMillivolts(uint8_t channel, uint16_t target_mv)

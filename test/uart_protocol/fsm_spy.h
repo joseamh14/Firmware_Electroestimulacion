@@ -39,11 +39,20 @@ typedef struct {
 
     int      stop_calls;
     int      getstatus_calls;
+    int      eeprom_calls;
+    HAL_StatusTypeDef eeprom_ret;   /* retorno de StoreAmplifierSafeDefault */
 
     HAL_StatusTypeDef ret;   /* retorno de Start / setters / Stop         */
 } FsmSpy_t;
 
 extern FsmSpy_t g_fsm;
 void FsmSpy_Reset(void);
+
+/* Registrador de corriente simulado (GET CUR) y flash simulada (SAVE CAL) */
+#include "sd_logger.h"
+extern SdLogStatus_t     g_log;
+extern HAL_StatusTypeDef g_flash_ret;
+extern int               g_flash_appends;
+void LogSpy_Reset(void);
 
 #endif /* TEST_FSM_SPY_H_ */

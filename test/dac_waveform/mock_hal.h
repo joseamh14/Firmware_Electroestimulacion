@@ -15,8 +15,10 @@
  *     permite verificar por el API publico que la aritmetica llega bien al
  *     temporizador.
  *   - Las macros __HAL_TIM_SET_* y las constantes DAC_CHANNEL_* / DAC_ALIGN_*.
- *   - Prototipos de las cuatro funciones HAL de arranque/parada. Sus stubs
- *     no-op estan en mocks.c: la aritmetica de ComputeTimerParams no las usa.
+ *   - Prototipos de las funciones HAL de arranque/parada y de escritura del
+ *     DAC. Sus espias estan en mocks.c y modelan el estado de cada canal
+ *     (habilitado, disparo por TRGO habilitado y valor de DHR), para poder
+ *     comprobar que el canal se aparca en VBIAS en vez de deshabilitarse.
  ******************************************************************************
  */
 #ifndef TEST_MOCK_HAL_H_
@@ -43,7 +45,13 @@ typedef struct {
     uint32_t CNT;
 } TIM_HandleTypeDef;
 
-typedef struct { uint32_t dummy; } DAC_HandleTypeDef;
+/* DAC: solo el registro CR (bits TENx que el driver toca directamente). */
+typedef struct { uint32_t CR; } DAC_TypeDef;
+typedef struct { DAC_TypeDef *Instance; } DAC_HandleTypeDef;
+
+#define DAC_CR_TEN1       (0x00000002U)
+#define SET_BIT(REG, BIT)     ((REG) |= (BIT))
+#define CLEAR_BIT(REG, BIT)   ((REG) &= ~(BIT))
 
 /* --- Constantes de la HAL del DAC que referencia dac_waveform.c ------- */
 #define DAC_CHANNEL_1     (0x00000000U)
@@ -62,6 +70,9 @@ HAL_StatusTypeDef HAL_TIM_Base_Stop (TIM_HandleTypeDef *htim);
 HAL_StatusTypeDef HAL_DAC_Start_DMA(DAC_HandleTypeDef *hdac, uint32_t Channel,
                                     uint32_t *pData, uint32_t Length, uint32_t Alignment);
 HAL_StatusTypeDef HAL_DAC_Stop_DMA (DAC_HandleTypeDef *hdac, uint32_t Channel);
+HAL_StatusTypeDef HAL_DAC_Start    (DAC_HandleTypeDef *hdac, uint32_t Channel);
+HAL_StatusTypeDef HAL_DAC_SetValue (DAC_HandleTypeDef *hdac, uint32_t Channel,
+                                    uint32_t Alignment, uint32_t Data);
 
 /* ===================================================================== *
  *  Espia de la capa HAL (no forma parte de HAL)
@@ -72,6 +83,15 @@ typedef struct {
     int dac_start_dma_calls;
     int dac_stop_dma_calls;
     HAL_StatusTypeDef dac_start_dma_ret;   /* forzable para probar propagacion de fallo */
+    int      dac_start_calls;
+    int      dac_setvalue_calls;
+    /* Estado modelado por canal: [0] = DAC_CHANNEL_1, [1] = DAC_CHANNEL_2 */
+    bool     en[2];               /* canal habilitado (salida no flotante)  */
+    bool     dma[2];              /* volcado por DMA en marcha              */
+    uint32_t dhr[2];              /* ultimo valor escrito con SetValue      */
+    bool     ten_at_start_dma[2]; /* TENx en el momento de HAL_DAC_Start_DMA */
+    const uint32_t *dma_buf[2];
+    uint32_t dma_len[2];
 } DacHalSpy_t;
 
 extern DacHalSpy_t g_hal;

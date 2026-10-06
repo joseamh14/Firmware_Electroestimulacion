@@ -6,7 +6,8 @@
  *
  * uart_protocol.c arrastra session_fsm.h, que a su vez incluye ad5144.h,
  * dac_waveform.h y culture_selector.h (para tipos y constantes: DacBank_t,
- * DAC_FREQ_MIN/MAX_HZ, SESSION_*...). Este mock solo aporta los tipos HAL
+ * DAC_FREQ_MIN/MAX_HZ, SESSION_*...), y sd_logger.h, que incluye
+ * tia_reader.h (ADC_HandleTypeDef). current_calc.c se compila real. Este mock solo aporta los tipos HAL
  * que esas cabeceras necesitan para compilar. La logica de session_fsm NO
  * se compila: sus funciones son mocks (ver mocks.c). dac_waveform tampoco:
  * uart_protocol.c no lo llama directamente.
@@ -31,5 +32,6 @@ typedef struct { uint32_t dummy; } I2C_HandleTypeDef;
 typedef struct { uint32_t dummy; } DAC_HandleTypeDef;
 typedef struct { uint32_t dummy; } TIM_HandleTypeDef;
 typedef struct { uint32_t dummy; } RTC_HandleTypeDef;
+typedef struct { void *Instance; } ADC_HandleTypeDef;   /* tia_reader.h */
 
 #endif /* TEST_MOCK_HAL_H_ */
