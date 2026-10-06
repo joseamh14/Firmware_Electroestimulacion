@@ -33,6 +33,10 @@ HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAdd
     g_spy.ready_addr    = DevAddress;
     g_spy.ready_trials  = Trials;
     g_spy.ready_timeout = Timeout;
+    if (g_spy.ready_busy_left > 0) {
+        g_spy.ready_busy_left--;
+        return HAL_ERROR;   /* NACK: programando EEPROM */
+    }
     return g_spy.ready_ret;
 }
 
@@ -55,4 +59,15 @@ HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c, uint16_t DevA
         }
     }
     return g_spy.tx_ret;
+}
+
+uint32_t HAL_GetTick(void)
+{
+    return g_spy.tick_ms;
+}
+
+void HAL_Delay(uint32_t Delay)
+{
+    g_spy.delay_calls++;
+    g_spy.tick_ms += Delay;
 }

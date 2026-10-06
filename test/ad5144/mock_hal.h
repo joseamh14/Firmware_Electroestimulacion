@@ -44,6 +44,11 @@ HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *hi2c, uint16_t DevAdd
 HAL_StatusTypeDef HAL_I2C_Master_Transmit(I2C_HandleTypeDef *hi2c, uint16_t DevAddress,
                                           uint8_t *pData, uint16_t Size, uint32_t Timeout);
 
+/* Base de tiempo (la usa el sondeo por ACK tras escribir la EEPROM). El
+ * reloj falso solo avanza con HAL_Delay. */
+uint32_t HAL_GetTick(void);
+void     HAL_Delay(uint32_t Delay);
+
 /* ===================================================================== *
  *  Espia de la capa HAL de I2C (no forma parte de HAL)
  * ===================================================================== */
@@ -56,6 +61,10 @@ typedef struct {
     uint32_t          ready_trials;    /* ultimo Trials                   */
     uint32_t          ready_timeout;   /* ultimo Timeout                  */
     HAL_StatusTypeDef ready_ret;       /* retorno forzado                 */
+    int               ready_busy_left; /* n primeras llamadas -> HAL_ERROR
+                                          (chip ocupado programando EEPROM) */
+    uint32_t          tick_ms;         /* reloj falso de HAL_GetTick       */
+    int               delay_calls;
 
     /* --- HAL_I2C_Master_Transmit --- */
     int               tx_calls;

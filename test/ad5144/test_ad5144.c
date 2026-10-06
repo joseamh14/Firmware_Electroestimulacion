@@ -23,24 +23,31 @@
  * fabricante, no asumido.
  *
  * Cubre:
- *   1. AD5144_Init: punteros NULL, init correcto de U1 (0x2B) y U2 (0x28),
- *      shadow[] a cero, Trials/Timeout del sondeo, propagacion del fallo de
- *      HAL_I2C_IsDeviceReady.
+ *   1. AD5144_Init: punteros NULL, init correcto de U1 (0x28, ADDR=VLOGIC) y
+ *      U2 (0x2B, ADDR=GND) segun la tabla 15 de la datasheet, shadow[] a la
+ *      mitad de escala de encendido, Trials/Timeout del sondeo, propagacion
+ *      del fallo de HAL_I2C_IsDeviceReady.
  *   2. AD5144_SetChannelRaw: punteros NULL, trama exacta (byte 0 y byte 1)
  *      para los cuatro canales y codigos limite (0 y 255), el shadow[] se
  *      actualiza solo si la transaccion devuelve HAL_OK.
- *   3. AD5144_SetChannelMillivolts: full_scale_mv = 0 -> HAL_ERROR, clamp por
- *      encima de fondo de escala, redondeo al alza y a la baja, el codigo
- *      nunca supera 255, dev NULL.
- *   4. AD5144_AllChannelsZero: escribe 0 en A,B,C,D en orden, sigue con los
- *      canales restantes si uno falla y devuelve el estado del ULTIMO fallo
- *      (comportamiento actual del driver; ver HALLAZGO en el README).
+ *   3. AD5144_CodeForMillivolts / AD5144_SetChannelMillivolts con el modelo
+ *      de reostato en la realimentacion del inversor de ESA:
+ *      |OUT| = in_peak * R_AW(D) / 2,5 kOhm, R_AW(D) = (256-D)/256*R_AB + R_W.
+ *      Relacion inversa, objetivo inalcanzable -> HAL_ERROR sin escribir,
+ *      por debajo del minimo -> codigo 255, error de redondeo <= medio paso
+ *      en todo el barrido, resolucion <= 10 mV con la excursion del DAC.
+ *   5. AD5144_StoreEepromCode / AD5144_StoreSafePowerUp: Comando 11 de la
+ *      datasheet (0x80 | canal, dato), sondeo por ACK de 1 ms hasta 60 ms.
+ *   4. AD5144_AllChannelsZero: escribe 255 (ganancia minima, posicion
+ *      segura) en A,B,C,D en orden, sigue con los canales restantes si uno
+ *      falla y devuelve el estado del ULTIMO fallo (ver HALLAZGO en el README).
  ******************************************************************************
  */
 #include "mock_hal.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* El driver bajo prueba, sin modificar. */
 #include "ad5144.c"
@@ -65,8 +72,8 @@ static int g_fail;
 } while (0)
 
 /* Direcciones de los dos chips de la placa (strap del pin ADDR). */
-#define ADDR_U1  AD5144_I2C_ADDR_ADDR_VLOG   /* 0x2B, canales 1-4 */
-#define ADDR_U2  AD5144_I2C_ADDR_ADDR_GND    /* 0x28, canales 5-8 */
+#define ADDR_U1  AD5144_I2C_ADDR_ADDR_VLOG   /* 0x28, canales 1-4 (ADDR = 2V5) */
+#define ADDR_U2  AD5144_I2C_ADDR_ADDR_GND    /* 0x2B, canales 5-8 (ADDR = GND) */
 
 /* Direccion de 8 bits tal y como la pasa el driver (7 bits << 1). */
 static uint16_t addr8(uint8_t addr7) { return (uint16_t)(addr7 << 1); }
@@ -129,33 +136,37 @@ static void test_init(void)
     CHECK_EQ_U(g_spy.ready_calls, 0, "Init con NULL no sondea el bus");
     CHECK_EQ_U(g_spy.tx_calls, 0, "Init con NULL no transmite");
 
-    /* --- Init correcto de U1 (0x2B) --- */
+    /* --- Init correcto de U1 (0x28) --- */
     Ad5144Spy_Reset();
     memset(&dev, 0xAA, sizeof(dev));   /* shadow con basura antes de Init */
     g_spy.ready_ret = HAL_OK;
     CHECK(AD5144_Init(&dev, &hi2c, ADDR_U1) == HAL_OK, "U1: Init -> HAL_OK");
     CHECK(dev.hi2c == &hi2c, "U1: guarda el handle I2C");
-    CHECK_EQ_U(dev.addr7, ADDR_U1, "U1: guarda addr7 = 0x2B");
+    CHECK_EQ_U(dev.addr7, ADDR_U1, "U1: guarda addr7 = 0x28");
     CHECK_EQ_U(g_spy.ready_calls, 1, "U1: sondea el bus una vez");
-    CHECK_EQ_U(g_spy.ready_addr, addr8(ADDR_U1), "U1: sondea en 0x2B << 1 = 0x56");
+    CHECK_EQ_U(g_spy.ready_addr, addr8(ADDR_U1), "U1: sondea en 0x28 << 1 = 0x50");
+    CHECK_EQ_U(g_spy.ready_addr, 0x50U, "U1: direccion de 8 bits 0x50");
     CHECK_EQ_U(g_spy.ready_trials, 2U, "U1: Trials = 2");
     CHECK_EQ_U(g_spy.ready_timeout, AD5144_I2C_TIMEOUT_MS, "U1: Timeout del sondeo");
     CHECK_EQ_U(g_spy.tx_calls, 0, "U1: Init no escribe ningun RDAC");
-    CHECK_EQ_U(dev.shadow[0], 0U, "U1: shadow[0] = 0 tras Init");
-    CHECK_EQ_U(dev.shadow[1], 0U, "U1: shadow[1] = 0 tras Init");
-    CHECK_EQ_U(dev.shadow[2], 0U, "U1: shadow[2] = 0 tras Init");
-    CHECK_EQ_U(dev.shadow[3], 0U, "U1: shadow[3] = 0 tras Init");
+    CHECK_EQ_U(dev.shadow[0], AD5144_CODE_POWERUP, "U1: shadow[0] = 128 (EEPROM de fabrica) tras Init");
+    CHECK_EQ_U(dev.shadow[1], AD5144_CODE_POWERUP, "U1: shadow[1] = 128 (EEPROM de fabrica) tras Init");
+    CHECK_EQ_U(dev.shadow[2], AD5144_CODE_POWERUP, "U1: shadow[2] = 128 (EEPROM de fabrica) tras Init");
+    CHECK_EQ_U(dev.shadow[3], AD5144_CODE_POWERUP, "U1: shadow[3] = 128 (EEPROM de fabrica) tras Init");
 
-    /* --- Init correcto de U2 (0x28) --- */
+    /* --- Init correcto de U2 (0x2B) --- */
     Ad5144Spy_Reset();
     g_spy.ready_ret = HAL_OK;
     CHECK(AD5144_Init(&dev, &hi2c, ADDR_U2) == HAL_OK, "U2: Init -> HAL_OK");
-    CHECK_EQ_U(dev.addr7, ADDR_U2, "U2: guarda addr7 = 0x28");
-    CHECK_EQ_U(g_spy.ready_addr, addr8(ADDR_U2), "U2: sondea en 0x28 << 1 = 0x50");
+    CHECK_EQ_U(dev.addr7, ADDR_U2, "U2: guarda addr7 = 0x2B");
+    CHECK_EQ_U(g_spy.ready_addr, addr8(ADDR_U2), "U2: sondea en 0x2B << 1 = 0x56");
+    CHECK_EQ_U(g_spy.ready_addr, 0x56U, "U2: direccion de 8 bits 0x56");
 
-    /* Las dos constantes de direccion de la cabecera son las esperadas. */
-    CHECK_EQ_U(AD5144_I2C_ADDR_ADDR_VLOG, 0x2BU, "AD5144_I2C_ADDR_ADDR_VLOG = 0x2B");
-    CHECK_EQ_U(AD5144_I2C_ADDR_ADDR_GND, 0x28U, "AD5144_I2C_ADDR_ADDR_GND = 0x28");
+    /* Las dos constantes de direccion de la cabecera son las de la tabla 15
+     * de la datasheet (TSSOP-20): ADDR = VLOGIC -> 0101000, GND -> 0101011. */
+    CHECK_EQ_U(AD5144_I2C_ADDR_ADDR_VLOG, 0x28U, "AD5144_I2C_ADDR_ADDR_VLOG = 0x28 (0101000)");
+    CHECK_EQ_U(AD5144_I2C_ADDR_ADDR_GND, 0x2BU, "AD5144_I2C_ADDR_ADDR_GND = 0x2B (0101011)");
+    CHECK(AD5144_I2C_ADDR_ADDR_VLOG != AD5144_I2C_ADDR_ADDR_GND, "U1 y U2 en direcciones distintas");
 
     /* --- Propagacion del fallo de HAL_I2C_IsDeviceReady --- */
     static const HAL_StatusTypeDef fails[] = { HAL_ERROR, HAL_BUSY, HAL_TIMEOUT };
@@ -167,12 +178,12 @@ static void test_init(void)
         snprintf(msg, sizeof(msg), "sondeo devuelve %d -> Init propaga el mismo estado", (int)fails[i]);
         CHECK(AD5144_Init(&dev, &hi2c, ADDR_U1) == fails[i], msg);
         /* HALLAZGO (menor): aun con el sondeo fallido, Init deja el handle
-         * completamente poblado -- hi2c y addr7 escritos, shadow a cero. Un
+         * completamente poblado -- hi2c y addr7 escritos, shadow a 128. Un
          * llamante que ignore el valor de retorno se queda con un handle de
          * aspecto usable. Ver README. */
         CHECK(dev.hi2c == &hi2c, "tras sondeo fallido, hi2c queda igualmente asignado");
-        CHECK_EQ_U(dev.shadow[0], 0U, "tras sondeo fallido, shadow[0] = 0");
-        CHECK_EQ_U(dev.shadow[3], 0U, "tras sondeo fallido, shadow[3] = 0");
+        CHECK_EQ_U(dev.shadow[0], AD5144_CODE_POWERUP, "tras sondeo fallido, shadow[0] = 128");
+        CHECK_EQ_U(dev.shadow[3], AD5144_CODE_POWERUP, "tras sondeo fallido, shadow[3] = 128");
     }
 }
 
@@ -240,123 +251,127 @@ static void test_set_channel_raw(void)
 }
 
 /* ================================================================== *
- *  3. AD5144_SetChannelMillivolts
+ *  3. AD5144_CodeForMillivolts / AD5144_SetChannelMillivolts
  * ================================================================== */
 
-/* Codigo de wiper que espera la formula del driver:
- *   round(target_mv * 255 / full_scale_mv), con target clampeado a fondo de
- *   escala. */
-static uint32_t expected_code(uint16_t target_mv, uint16_t full_scale_mv)
+/* Modelo fisico reimplementado en el arnes, en doble precision e
+ * independiente de la aritmetica entera del driver:
+ *   R_AW(D) = (256 - D)/256 * R_AB + R_W
+ *   |OUT|   = in_peak * R_AW(D) / R_IN                                  */
+static double model_out_mv(uint8_t code, double in_peak_mv, double rab, double rw)
 {
-    if (target_mv > full_scale_mv) {
-        target_mv = full_scale_mv;
-    }
-    uint32_t c = ((uint32_t)target_mv * 255U + (full_scale_mv / 2U)) / full_scale_mv;
-    if (c > 255U) {
-        c = 255U;
-    }
-    return c;
+    double raw = (256.0 - (double)code) / 256.0 * rab + rw;
+    return in_peak_mv * raw / (double)AD5144_RIN_OHM;
 }
+
+/* Excursion de Dif con la que trabaja la placa: 690 codigos de DAC con
+ * VREF = 3,3 V -> 556 mV (DAC_DIF_PEAK_MV en dac_waveform.h). Se copia el
+ * numero aqui porque el arnes no enlaza dac_waveform. */
+#define BOARD_IN_PEAK_MV  (556U)
 
 static void test_set_channel_millivolts(void)
 {
-    printf("[test] AD5144_SetChannelMillivolts: full_scale 0, clamp, redondeo, tope 255, dev NULL\n");
+    printf("[test] AD5144_CodeForMillivolts / SetChannelMillivolts: modelo de reostato inverso\n");
 
     AD5144_Handle_t dev;
     I2C_HandleTypeDef hi2c;
+    uint8_t code;
 
-    /* --- full_scale_mv = 0 -> HAL_ERROR, sin tocar el bus --- */
+    /* --- Validacion de argumentos --- */
+    CHECK(AD5144_CodeForMillivolts(100U, 0U, &code) == HAL_ERROR, "in_peak = 0 -> HAL_ERROR");
+    CHECK(AD5144_CodeForMillivolts(100U, 556U, NULL) == HAL_ERROR, "out_code NULL -> HAL_ERROR");
     init_ok(&dev, &hi2c, ADDR_U1);
     CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_A, 100U, 0U) == HAL_ERROR,
-          "full_scale_mv = 0 -> HAL_ERROR");
-    CHECK_EQ_U(g_spy.tx_calls, 0, "full_scale 0 no transmite");
-
-    /* --- dev NULL -> HAL_ERROR aunque full_scale sea valido --- */
+          "SetChannelMillivolts con in_peak = 0 -> HAL_ERROR");
+    CHECK_EQ_U(g_spy.tx_calls, 0, "in_peak 0 no transmite");
     Ad5144Spy_Reset();
-    CHECK(AD5144_SetChannelMillivolts(NULL, AD5144_CH_A, 100U, 1000U) == HAL_ERROR,
+    CHECK(AD5144_SetChannelMillivolts(NULL, AD5144_CH_A, 100U, 556U) == HAL_ERROR,
           "dev NULL -> HAL_ERROR");
     CHECK_EQ_U(g_spy.tx_calls, 0, "dev NULL no transmite");
 
-    /* --- Clamp: target por encima de fondo de escala se limita, no se
-     *     escala fuera de rango --- */
-    init_ok(&dev, &hi2c, ADDR_U1);
-    CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_A, 1500U, 1000U) == HAL_OK,
-          "target 1500 > fs 1000: HAL_OK");
-    expect_frame(0, ADDR_U1, 0x10U, 255U, "target > fs -> code 255 (clamp)");
-    CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_A, 1000U, 1000U) == HAL_OK,
-          "target == fs: HAL_OK");
-    expect_frame(1, ADDR_U1, 0x10U, 255U, "target == fs -> code 255");
+    /* --- Relacion INVERSA: mas amplitud -> codigo menor --- */
+    uint8_t c500, c1000, c2000;
+    CHECK(AD5144_CodeForMillivolts( 500U, BOARD_IN_PEAK_MV, &c500)  == HAL_OK, "500 mV alcanzable");
+    CHECK(AD5144_CodeForMillivolts(1000U, BOARD_IN_PEAK_MV, &c1000) == HAL_OK, "1000 mV alcanzable");
+    CHECK(AD5144_CodeForMillivolts(2000U, BOARD_IN_PEAK_MV, &c2000) == HAL_OK, "2000 mV alcanzable");
+    CHECK(c500 > c1000 && c1000 > c2000, "codigo decrece al subir la amplitud");
 
-    /* --- Redondeo en varios puntos del rango (fs = 1000 mV) --------------
-     *   target : codigo exacto -> redondeado
-     *      1   :  0.255  -> 0   (a la baja)
-     *      2   :  0.510  -> 1   (al alza)
-     *     99   : 25.245  -> 25  (a la baja)
-     *    100   : 25.500  -> 26  (al alza, empate)
-     *    500   : 127.500 -> 128 (al alza, empate)
-     *    997   : 254.235 -> 254 (a la baja)
-     *    999   : 254.745 -> 255 (al alza) */
-    struct { uint16_t mv; uint8_t code; const char *nota; } pts[] = {
-        {   0U,   0U, "0 mV -> 0" },
-        {   1U,   0U, "1 mV (0.255) -> 0 [a la baja]" },
-        {   2U,   1U, "2 mV (0.510) -> 1 [al alza]" },
-        {  99U,  25U, "99 mV (25.245) -> 25 [a la baja]" },
-        { 100U,  26U, "100 mV (25.500) -> 26 [al alza, empate]" },
-        { 500U, 128U, "500 mV (127.500) -> 128 [al alza, empate]" },
-        { 997U, 254U, "997 mV (254.235) -> 254 [a la baja]" },
-        { 999U, 255U, "999 mV (254.745) -> 255 [al alza]" },
-        {1000U, 255U, "1000 mV -> 255" },
-    };
-    for (size_t i = 0U; i < sizeof(pts) / sizeof(pts[0]); i++) {
-        init_ok(&dev, &hi2c, ADDR_U1);
-        CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_C, pts[i].mv, 1000U) == HAL_OK, pts[i].nota);
-        expect_frame(0, ADDR_U1, 0x12U, pts[i].code, pts[i].nota);
-        CHECK_EQ_U(dev.shadow[AD5144_CH_C], pts[i].code, "shadow = codigo redondeado");
-        /* referencia cruzada con la formula reimplementada en el arnes */
-        CHECK_EQ_U(pts[i].code, expected_code(pts[i].mv, 1000U), "codigo esperado coincide con la formula");
-    }
+    /* Puntos calculados a mano (R_AB 10k, R_W 125, R_IN 2k5, in_peak 556):
+     *   1000 mV: R_AW = 4496,4 -> (4371,4)*256/10000 = 111,9 -> 112 -> D = 144
+     *   2000 mV: R_AW = 8992,8 -> (8867,8)*256/10000 = 227,0 -> 227 -> D = 29 */
+    CHECK_EQ_U(c1000, 144U, "1000 mV con in_peak 556 -> D = 144");
+    CHECK_EQ_U(c2000, 29U,  "2000 mV con in_peak 556 -> D = 29");
 
-    /* --- fs = 2000 mV (limite de software del proyecto) --- */
+    /* --- 0 mV y por debajo del minimo alcanzable -> posicion segura 255 --- */
+    CHECK(AD5144_CodeForMillivolts(0U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "0 mV -> HAL_OK");
+    CHECK_EQ_U(code, AD5144_CODE_MIN_GAIN, "0 mV -> codigo 255 (ganancia minima)");
+    CHECK(AD5144_CodeForMillivolts(5U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "5 mV -> HAL_OK");
+    CHECK_EQ_U(code, AD5144_CODE_MIN_GAIN, "5 mV (< minimo ~36 mV) -> codigo 255");
+
+    /* --- Inalcanzable (mas ganancia de la que hay) -> HAL_ERROR, sin bus --- */
     init_ok(&dev, &hi2c, ADDR_U2);
-    CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_A, 2000U, 2000U) == HAL_OK, "fs 2000: target 2000 -> 255");
-    expect_frame(0, ADDR_U2, 0x10U, 255U, "fs 2000, target 2000");
-    CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_A, 1000U, 2000U) == HAL_OK, "fs 2000: target 1000 -> 128");
-    expect_frame(1, ADDR_U2, 0x10U, 128U, "fs 2000, target 1000 (medio)");
+    dev.shadow[AD5144_CH_B] = 0x77U;
+    CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_B, 2000U, 100U) == HAL_ERROR,
+          "2000 mV con in_peak 100 mV (ganancia 20) -> HAL_ERROR");
+    CHECK_EQ_U(g_spy.tx_calls, 0, "objetivo inalcanzable: no se escribe nada");
+    CHECK_EQ_U(dev.shadow[AD5144_CH_B], 0x77U, "objetivo inalcanzable: shadow intacto");
 
-    /* --- El codigo resultante NUNCA supera 255, en todo el barrido del rango,
-     *     para varias escalas (incluye fs impar). La rama 'if (code > 255)'
-     *     del driver es, con estas entradas, inalcanzable: el clamp previo de
-     *     target ya acota el maximo a 255. Ver README (HALLAZGO menor).
-     *     Barrido agregado: se cuentan las discrepancias y se afirman al
-     *     final (mismo estilo que el barrido de banda de dac_waveform). --- */
-    static const uint16_t scales[] = { 100U, 333U, 1000U, 1200U, 2000U, 65535U };
-    int sweep_err_ret   = 0;   /* alguna llamada no devolvio HAL_OK        */
-    int sweep_over_255  = 0;   /* algun codigo > 255                       */
-    int sweep_mismatch  = 0;   /* codigo != formula del arnes              */
-    int sweep_clamp_bad = 0;   /* target >= fs y codigo != 255             */
-    unsigned long sweep_points = 0UL;
+    /* Limite exacto: el maximo alcanzable con D = 0 es in_peak*(R_AB+R_W)/R_IN.
+     * Con in_peak 556: 556*10125/2500 = 2251,8 mV. 2251 -> D = 0; 2300 -> error. */
+    CHECK(AD5144_CodeForMillivolts(2251U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "2251 mV justo alcanzable");
+    CHECK_EQ_U(code, 0U, "2251 mV -> D = 0 (ganancia maxima)");
+    CHECK(AD5144_CodeForMillivolts(2300U, BOARD_IN_PEAK_MV, &code) == HAL_ERROR, "2300 mV -> HAL_ERROR");
+
+    /* --- Trama completa de un SetChannelMillivolts valido --- */
     init_ok(&dev, &hi2c, ADDR_U1);
-    for (size_t s = 0U; s < sizeof(scales) / sizeof(scales[0]); s++) {
-        uint16_t fs   = scales[s];
-        uint32_t step = (fs > 400U) ? (fs / 400U) : 1U;   /* barrido muestreado */
-        for (uint32_t mv = 0U; mv <= (uint32_t)fs + step; mv += step) {
-            uint16_t t = (mv > 0xFFFFU) ? 0xFFFFU : (uint16_t)mv;
-            Ad5144Spy_Reset();
-            g_spy.ready_ret = HAL_OK;
-            if (AD5144_SetChannelMillivolts(&dev, AD5144_CH_A, t, fs) != HAL_OK) { sweep_err_ret++; }
-            if (g_spy.tx_b1[0] > 255U) { sweep_over_255++; }   /* imposible en uint8_t, explicito */
-            if ((uint32_t)g_spy.tx_b1[0] != expected_code(t, fs)) { sweep_mismatch++; }
-            if (t >= fs && g_spy.tx_b1[0] != 255U) { sweep_clamp_bad++; }
-            sweep_points++;
+    CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_C, 1000U, BOARD_IN_PEAK_MV) == HAL_OK,
+          "SetChannelMillivolts 1000 mV -> HAL_OK");
+    expect_frame(0, ADDR_U1, 0x12U, 144U, "canal C @ 1000 mV");
+    CHECK_EQ_U(dev.shadow[AD5144_CH_C], 144U, "shadow = 144");
+
+    /* --- Barrido 0..2000 mV en pasos de 1 mV, tres excursiones de entrada.
+     *     Para cada punto alcanzable por encima del minimo se comprueba,
+     *     contra el modelo en doble precision, que el codigo elegido deja la
+     *     salida a no mas de medio paso del objetivo. --- */
+    static const uint16_t peaks[] = { BOARD_IN_PEAK_MV, 500U, 700U };
+    unsigned long pts = 0UL;
+    int err_ret = 0, err_round = 0, err_mono = 0;
+    double worst_step = 0.0;
+    for (size_t k = 0U; k < sizeof(peaks) / sizeof(peaks[0]); k++) {
+        double inp   = (double)peaks[k];
+        double vmin  = model_out_mv(255U, inp, AD5144_RAB_OHM, AD5144_RW_OHM);
+        double vmax  = model_out_mv(0U,   inp, AD5144_RAB_OHM, AD5144_RW_OHM);
+        double step  = inp * ((double)AD5144_RAB_OHM / 256.0) / (double)AD5144_RIN_OHM;
+        if (step > worst_step && peaks[k] == BOARD_IN_PEAK_MV) { worst_step = step; }
+        uint8_t prev = 255U;
+        for (uint32_t mv = 0U; mv <= 2000U; mv++) {
+            if ((double)mv > vmax + step / 2.0) { break; }
+            uint8_t c;
+            if (AD5144_CodeForMillivolts((uint16_t)mv, peaks[k], &c) != HAL_OK) { err_ret++; continue; }
+            if (c > prev) { err_mono++; }   /* nunca sube al subir el objetivo */
+            prev = c;
+            if ((double)mv >= vmin) {
+                double out = model_out_mv(c, inp, AD5144_RAB_OHM, AD5144_RW_OHM);
+                if (fabs(out - (double)mv) > step / 2.0 + 1e-6) { err_round++; }
+            }
+            pts++;
         }
     }
-    printf("   barrido mV->code: %lu puntos sobre %lu escalas\n",
-           sweep_points, (unsigned long)(sizeof(scales) / sizeof(scales[0])));
-    CHECK(sweep_points > 2000UL, "el barrido cubre miles de puntos");
-    CHECK_EQ_U(sweep_err_ret, 0,   "toda llamada del barrido devuelve HAL_OK");
-    CHECK_EQ_U(sweep_over_255, 0,  "ningun codigo supera 255 en todo el barrido");
-    CHECK_EQ_U(sweep_mismatch, 0,  "todo el barrido coincide con la formula del driver");
-    CHECK_EQ_U(sweep_clamp_bad, 0, "target >= fondo de escala -> code 255 en todo el barrido");
+    printf("   barrido mV->code: %lu puntos, paso con in_peak 556 mV = %.2f mV\n", pts, worst_step);
+    CHECK(pts > 5000UL, "el barrido cubre miles de puntos");
+    CHECK_EQ_U(err_ret, 0,   "todo objetivo <= maximo alcanzable devuelve HAL_OK");
+    CHECK_EQ_U(err_mono, 0,  "el codigo es monotono decreciente con el objetivo");
+    CHECK_EQ_U(err_round, 0, "error de salida <= medio paso en todo el barrido");
+    CHECK(worst_step < 10.0, "resolucion con la excursion de la placa < 10 mV/paso");
+
+    /* --- Margen de diseno con la tolerancia de R_AB (+/-8 %) y la excursion
+     *     de la placa: con R_AB -8 % aun se alcanzan 2 V; con R_AB +8 % y
+     *     D = 0 la salida no supera los 2,5 V de los terminales del AD5144. */
+    double vmax_low  = model_out_mv(0U, BOARD_IN_PEAK_MV, AD5144_RAB_OHM * 0.92, 55.0);
+    double vmax_high = model_out_mv(0U, BOARD_IN_PEAK_MV, AD5144_RAB_OHM * 1.08, 125.0);
+    printf("   salida con D = 0: %.0f mV (R_AB -8 %%), %.0f mV (R_AB +8 %%)\n", vmax_low, vmax_high);
+    CHECK(vmax_low  >= 2000.0, "R_AB -8 %: 2 V siguen siendo alcanzables");
+    CHECK(vmax_high <= 2500.0, "R_AB +8 %: D = 0 no saca los terminales de +/-2,5 V");
 }
 
 /* ================================================================== *
@@ -364,12 +379,12 @@ static void test_set_channel_millivolts(void)
  * ================================================================== */
 static void test_all_channels_zero(void)
 {
-    printf("[test] AD5144_AllChannelsZero: orden A,B,C,D, no corta ante fallo, devuelve el ultimo fallo\n");
+    printf("[test] AD5144_AllChannelsZero: codigo 255, orden A,B,C,D, no corta ante fallo, devuelve el ultimo fallo\n");
 
     AD5144_Handle_t dev;
     I2C_HandleTypeDef hi2c;
 
-    /* --- Camino feliz: 4 escrituras de 0 en orden A,B,C,D --- */
+    /* --- Camino feliz: 4 escrituras de 255 (ganancia minima) en orden A,B,C,D --- */
     init_ok(&dev, &hi2c, ADDR_U1);
     /* ensuciamos el shadow[] con escrituras previas */
     for (int i = 0; i < 4; i++) {
@@ -378,12 +393,16 @@ static void test_all_channels_zero(void)
     Ad5144Spy_Reset();
     CHECK(AD5144_AllChannelsZero(&dev) == HAL_OK, "todo OK -> HAL_OK");
     CHECK_EQ_U(g_spy.tx_calls, 4, "exactamente 4 transacciones");
-    expect_frame(0, ADDR_U1, 0x10U, 0x00U, "AllZero paso 1 = canal A a 0");
-    expect_frame(1, ADDR_U1, 0x11U, 0x00U, "AllZero paso 2 = canal B a 0");
-    expect_frame(2, ADDR_U1, 0x12U, 0x00U, "AllZero paso 3 = canal C a 0");
-    expect_frame(3, ADDR_U1, 0x13U, 0x00U, "AllZero paso 4 = canal D a 0");
+    expect_frame(0, ADDR_U1, 0x10U, 0xFFU, "AllZero paso 1 = canal A a 255");
+    expect_frame(1, ADDR_U1, 0x11U, 0xFFU, "AllZero paso 2 = canal B a 255");
+    expect_frame(2, ADDR_U1, 0x12U, 0xFFU, "AllZero paso 3 = canal C a 255");
+    expect_frame(3, ADDR_U1, 0x13U, 0xFFU, "AllZero paso 4 = canal D a 255");
     for (int i = 0; i < 4; i++) {
-        CHECK_EQ_U(dev.shadow[i], 0U, "shadow[canal] = 0 tras AllChannelsZero");
+        CHECK_EQ_U(dev.shadow[i], 255U, "shadow[canal] = 255 tras AllChannelsZero");
+    }
+    /* Nunca escribe el codigo 0: con el reostato seria la ganancia MAXIMA. */
+    for (int i = 0; i < 4; i++) {
+        CHECK(g_spy.tx_b1[i] != 0x00U, "AllChannelsZero nunca escribe el codigo 0");
     }
 
     /* --- Un fallo a mitad NO corta el barrido y el estado devuelto es el
@@ -391,7 +410,7 @@ static void test_all_channels_zero(void)
      *     intermedios -> HALLAZGO documentado en el README) --- */
     init_ok(&dev, &hi2c, ADDR_U1);
     for (int i = 0; i < 4; i++) {
-        AD5144_SetChannelRaw(&dev, (AD5144_Channel_t)i, 0xEEU);   /* shadow != 0 en los 4 */
+        AD5144_SetChannelRaw(&dev, (AD5144_Channel_t)i, 0xEEU);   /* shadow != 255 en los 4 */
     }
     Ad5144Spy_Reset();
     g_spy.tx_ret_seq[1] = HAL_TIMEOUT;   /* canal B falla */
@@ -399,9 +418,9 @@ static void test_all_channels_zero(void)
     HAL_StatusTypeDef r = AD5144_AllChannelsZero(&dev);
     CHECK_EQ_U(g_spy.tx_calls, 4, "sigue intentando los 4 canales pese a los fallos");
     CHECK(r == HAL_BUSY, "devuelve el ultimo fallo (HAL_BUSY), no el primero (HAL_TIMEOUT)");
-    CHECK_EQ_U(dev.shadow[AD5144_CH_A], 0U,    "canal A OK -> shadow 0");
+    CHECK_EQ_U(dev.shadow[AD5144_CH_A], 255U,  "canal A OK -> shadow 255");
     CHECK_EQ_U(dev.shadow[AD5144_CH_B], 0xEEU, "canal B fallo -> shadow intacto");
-    CHECK_EQ_U(dev.shadow[AD5144_CH_C], 0U,    "canal C OK -> shadow 0");
+    CHECK_EQ_U(dev.shadow[AD5144_CH_C], 255U,  "canal C OK -> shadow 255");
     CHECK_EQ_U(dev.shadow[AD5144_CH_D], 0xEEU, "canal D fallo -> shadow intacto");
 
     /* --- Si solo falla el primer canal, se devuelve ese estado --- */
@@ -424,6 +443,70 @@ static void test_all_channels_zero(void)
     CHECK_EQ_U(g_spy.tx_calls, 0, "dev->hi2c NULL no transmite");
 }
 
+
+/* ================================================================== *
+ *  5. EEPROM: AD5144_StoreEepromCode / AD5144_StoreSafePowerUp
+ * ================================================================== */
+static void test_eeprom(void)
+{
+    printf("[test] EEPROM: Comando 11, sondeo por ACK, posicion segura\n");
+
+    AD5144_Handle_t dev;
+    I2C_HandleTypeDef hi2c;
+
+    CHECK_EQ_U(AD5144_CMD_WRITE_EEPROM, 0x08U, "Comando 11: nibble de control 1000");
+    CHECK_EQ_U(BuildCommandByte(AD5144_CMD_WRITE_EEPROM, AD5144_CH_C), 0x82U, "EEPROM canal C -> 0x82");
+
+    /* NULL */
+    Ad5144Spy_Reset();
+    CHECK(AD5144_StoreEepromCode(NULL, AD5144_CH_A, 255U) == HAL_ERROR, "dev NULL -> HAL_ERROR");
+    CHECK_EQ_U(g_spy.tx_calls, 0, "dev NULL no transmite");
+
+    /* Programacion inmediata: trama y un unico sondeo */
+    init_ok(&dev, &hi2c, ADDR_U2);
+    dev.shadow[AD5144_CH_B] = 0x33U;
+    CHECK(AD5144_StoreEepromCode(&dev, AD5144_CH_B, 0xFFU) == HAL_OK, "EEPROM canal B -> HAL_OK");
+    CHECK_EQ_U(g_spy.tx_calls, 1, "una trama");
+    expect_frame(0, ADDR_U2, 0x81U, 0xFFU, "EEPROM canal B @ 255");
+    CHECK_EQ_U(g_spy.ready_calls, 1, "un sondeo basta si el chip ya responde");
+    CHECK_EQ_U(g_spy.ready_addr, addr8(ADDR_U2), "sondeo en la direccion del chip");
+    CHECK_EQ_U(dev.shadow[AD5144_CH_B], 0x33U, "escribir EEPROM no cambia el RDAC (shadow intacto)");
+
+    /* Chip ocupado 20 ms: se reintenta cada 1 ms hasta que responde */
+    init_ok(&dev, &hi2c, ADDR_U1);
+    g_spy.ready_busy_left = 20;
+    CHECK(AD5144_StoreEepromCode(&dev, AD5144_CH_A, 0xFFU) == HAL_OK, "ocupado 20 intentos -> HAL_OK");
+    CHECK_EQ_U(g_spy.ready_calls, 21, "21 sondeos (20 NACK + 1 ACK)");
+    CHECK_EQ_U(g_spy.tick_ms, 20U, "20 ms de espera, 1 ms por intento");
+
+    /* Nunca responde: HAL_TIMEOUT a los 60 ms, sin bucle infinito */
+    init_ok(&dev, &hi2c, ADDR_U1);
+    g_spy.ready_busy_left = 100000;
+    CHECK(AD5144_StoreEepromCode(&dev, AD5144_CH_A, 0xFFU) == HAL_TIMEOUT, "sin ACK -> HAL_TIMEOUT");
+    CHECK_EQ_U(g_spy.tick_ms, AD5144_EEPROM_TIMEOUT_MS, "se rinde a los 60 ms");
+
+    /* Fallo de la propia trama: no se sondea */
+    init_ok(&dev, &hi2c, ADDR_U1);
+    g_spy.tx_ret = HAL_ERROR;
+    CHECK(AD5144_StoreEepromCode(&dev, AD5144_CH_A, 0xFFU) == HAL_ERROR, "trama fallida -> HAL_ERROR");
+    CHECK_EQ_U(g_spy.ready_calls, 0, "sin trama no hay sondeo");
+
+    /* StoreSafePowerUp: 255 en la EEPROM de A,B,C,D en orden */
+    init_ok(&dev, &hi2c, ADDR_U1);
+    CHECK(AD5144_StoreSafePowerUp(&dev) == HAL_OK, "StoreSafePowerUp -> HAL_OK");
+    CHECK_EQ_U(g_spy.tx_calls, 4, "cuatro tramas");
+    expect_frame(0, ADDR_U1, 0x80U, 0xFFU, "EEPROM A @ 255");
+    expect_frame(1, ADDR_U1, 0x81U, 0xFFU, "EEPROM B @ 255");
+    expect_frame(2, ADDR_U1, 0x82U, 0xFFU, "EEPROM C @ 255");
+    expect_frame(3, ADDR_U1, 0x83U, 0xFFU, "EEPROM D @ 255");
+
+    /* Un fallo a mitad no corta el resto */
+    init_ok(&dev, &hi2c, ADDR_U1);
+    g_spy.tx_ret_seq[1] = HAL_BUSY;
+    CHECK(AD5144_StoreSafePowerUp(&dev) == HAL_BUSY, "fallo en B -> devuelve HAL_BUSY");
+    CHECK_EQ_U(g_spy.tx_calls, 4, "sigue con C y D");
+}
+
 /* ------------------------------------------------------------------ */
 int main(void)
 {
@@ -434,6 +517,7 @@ int main(void)
     test_set_channel_raw();
     test_set_channel_millivolts();
     test_all_channels_zero();
+    test_eeprom();
 
     printf("\n=== %d comprobaciones, %d fallos ===\n", g_checks, g_fail);
     if (g_fail == 0) { printf("RESULTADO: OK\n"); return 0; }

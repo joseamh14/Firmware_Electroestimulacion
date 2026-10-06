@@ -106,9 +106,21 @@ typedef struct {
     int      sel_setwell_calls;
     int      sel_alldisconnect_calls;
     uint8_t  sel_well_state;        /* mascara reconstruida de SetWell     */
+    int      ad_eeprom_calls;       /* AD5144_StoreSafePowerUp             */
+    uint8_t  ad_fail_mask;          /* bit i: falla SetChannelMillivolts del
+                                       canal absoluto i+1 (bus I2C)        */
+    bool     dac_fail;              /* DacWaveform_SetFrequency falla      */
 } MockSpy_t;
 
 extern MockSpy_t g_spy;
 void MockSpy_Reset(void);
+
+/* Copia en flash (sustituye a flash_log): guarda el ultimo payload escrito
+ * y persiste entre "reinicios" igual que la flash real. */
+void            MockFlash_Reset(void);           /* flash vacia             */
+int             MockFlash_AppendCount(void);
+const uint32_t *MockFlash_LastWords(void);       /* ultimo payload (palabras) */
+uint32_t       *MockFlash_LastWordsRaw(void);    /* para alterarlo a mano    */
+void            MockFlash_SetWriteFail(bool fail);
 
 #endif /* TEST_MOCK_HAL_H_ */

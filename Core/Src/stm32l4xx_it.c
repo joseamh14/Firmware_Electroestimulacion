@@ -22,6 +22,7 @@
 #include "stm32l4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "flash_log.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,6 +57,7 @@
 
 /* External variables --------------------------------------------------------*/
 extern PCD_HandleTypeDef hpcd_USB_OTG_FS;
+extern DMA_HandleTypeDef hdma_adc1;
 extern DMA_HandleTypeDef hdma_dac1_ch1;
 extern DMA_HandleTypeDef hdma_dac1_ch2;
 /* USER CODE BEGIN EV */
@@ -71,7 +73,17 @@ extern DMA_HandleTypeDef hdma_dac1_ch2;
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
+  /* Error ECC doble al leer la flash: lo provoca una doble palabra a medio
+   * programar por un corte durante una escritura de flash_log. Se limpia el
+   * indicador y se avisa a flash_log, que descarta ese registro; el resto
+   * del sistema sigue. Cualquier otra causa de NMI cae al bucle infinito y
+   * el IWDG reinicia. */
+  if (__HAL_FLASH_GET_FLAG(FLASH_FLAG_ECCD))
+  {
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ECCD);
+    FlashLog_EccFault = true;
+    return;
+  }
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)
@@ -226,6 +238,20 @@ void DMA1_Channel2_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Channel2_IRQn 1 */
 
   /* USER CODE END DMA1_Channel2_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA1 channel3 global interrupt.
+  */
+void DMA1_Channel3_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Channel3_IRQn 0 */
+
+  /* USER CODE END DMA1_Channel3_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_adc1);
+  /* USER CODE BEGIN DMA1_Channel3_IRQn 1 */
+
+  /* USER CODE END DMA1_Channel3_IRQn 1 */
 }
 
 /**

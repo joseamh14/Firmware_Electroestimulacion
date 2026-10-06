@@ -9,6 +9,7 @@
 #include "ad5144.h"
 #include "dac_waveform.h"
 #include "culture_selector.h"
+#include "flash_log.h"
 #include <string.h>
 
 /* ===================================================================== *
@@ -116,6 +117,7 @@ HAL_StatusTypeDef AD5144_SetChannelMillivolts(AD5144_Handle_t *dev, AD5144_Chann
     if (dev == NULL) return HAL_ERROR;
     int base = (dev->addr7 == AD5144_I2C_ADDR_ADDR_VLOG) ? 4 : 0;
     g_spy.ad_setmv_calls++;
+    if ((g_spy.ad_fail_mask >> (base + (int)ch)) & 1U) return HAL_ERROR;
     g_spy.ad_setmv_last_mv[base + (int)ch] = target_mv;
     return HAL_OK;
 }
@@ -139,6 +141,7 @@ HAL_StatusTypeDef DacWaveform_SetFrequency(DacBank_t bank, uint32_t freq_hz)
 {
     if (bank != DAC_BANK_A && bank != DAC_BANK_B) return HAL_ERROR;
     g_spy.dac_setfreq_calls++;
+    if (g_spy.dac_fail && freq_hz != 0U) return HAL_ERROR;
     g_spy.dac_setfreq_last[(int)bank] = freq_hz;
     return HAL_OK;
 }
@@ -168,5 +171,55 @@ HAL_StatusTypeDef CultureSelector_AllDisconnect(void)
 {
     g_spy.sel_alldisconnect_calls++;
     g_spy.sel_well_state = 0U;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef AD5144_StoreSafePowerUp(AD5144_Handle_t *dev)
+{
+    if (dev == NULL) return HAL_ERROR;
+    g_spy.ad_eeprom_calls++;
+    return HAL_OK;
+}
+
+/* ===================================================================== *
+ *  flash_log simulado: un unico registro (el ultimo), persistente
+ * ===================================================================== */
+static uint32_t g_flash_words[FLASH_LOG_MAX_RECORD / 4U];
+static uint32_t g_flash_len;
+static bool     g_flash_valid;
+static int      g_flash_appends;
+static bool     g_flash_fail;
+
+void MockFlash_Reset(void)
+{
+    memset(g_flash_words, 0, sizeof(g_flash_words));
+    g_flash_len = 0U;
+    g_flash_valid = false;
+    g_flash_appends = 0;
+    g_flash_fail = false;
+}
+int             MockFlash_AppendCount(void)       { return g_flash_appends; }
+const uint32_t *MockFlash_LastWords(void)         { return g_flash_words; }
+uint32_t       *MockFlash_LastWordsRaw(void)      { return g_flash_words; }
+void            MockFlash_SetWriteFail(bool fail) { g_flash_fail = fail; }
+
+HAL_StatusTypeDef FlashLog_Append(const FlashLog_Config_t *cfg, const void *payload,
+                                  uint32_t payload_len)
+{
+    if (cfg == NULL || payload == NULL || payload_len > sizeof(g_flash_words)) return HAL_ERROR;
+    if (g_flash_fail) return HAL_ERROR;
+    memcpy(g_flash_words, payload, payload_len);
+    g_flash_len = payload_len;
+    g_flash_valid = true;
+    g_flash_appends++;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef FlashLog_ReadLatest(const FlashLog_Config_t *cfg, void *payload,
+                                      uint32_t payload_len, uint32_t *out_seq)
+{
+    if (cfg == NULL || payload == NULL || !g_flash_valid || payload_len > g_flash_len) return HAL_ERROR;
+    memcpy(payload, g_flash_words, payload_len);
+    if (out_seq != NULL) *out_seq = (uint32_t)g_flash_appends;
     return HAL_OK;
 }
