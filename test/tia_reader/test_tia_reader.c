@@ -6,14 +6,16 @@
  *
  * Cubre:
  *   1. Plan de medida segun la frecuencia: banco parado, rafaga de un
- *      periodo (100 kHz, 300 kHz, limite exacto) y dos flancos (baja f).
- *   2. Rotacion 1,5,2,6,3,7,4,8 con mascara.
+ *      periodo (100 kHz, 300 kHz, limite exacto) y rafagas por disparo
+ *      (baja f, 4 disparos por periodo del pulso bifasico con reposo).
+ *   2. Rotacion 1,2,...,8 con mascara.
  *   3. Modo periodo: un canal por armado, disparo del timer de su banco,
  *      mux cambiado y asentado antes de armar, como mucho un armado por ms,
  *      maximo y minimo acumulados por canal.
  *   4. Banco parado: sus canales se saltan.
- *   5. Modo dos flancos: rearme en la propia interrupcion sin tocar el mux
- *      y combinacion de las dos fases.
+ *   5. Modo flancos: cuatro rafagas por periodo, rearme en la propia
+ *      interrupcion sin tocar el mux y combinacion de maximo y minimo de
+ *      las cuatro (fase positiva, fase negativa y reposo).
  *   6. Rafaga que no llega: se aborta por tiempo y se sigue.
  *   7. Pausa / reanudacion / parada; interrupcion tardia ignorada; fallo
  *      de HAL_ADC_Start_DMA.
@@ -81,14 +83,18 @@ static void test_plan(void)
     CHECK(p.mode == TIA_PLAN_PERIOD, "300 kHz -> periodo");
     CHECK_EQ_U(p.samples, 18U + 8U, "300 kHz: 18 + 8");
 
-    p = TiaReader_PlanFor(5250U);
-    CHECK(p.mode == TIA_PLAN_PERIOD && p.samples <= TIA_READER_BUF_SAMPLES, "5250 Hz: aun cabe un periodo");
-    p = TiaReader_PlanFor(5249U);
-    CHECK(p.mode == TIA_PLAN_TWO_EDGES, "5249 Hz: ya no cabe -> dos flancos");
-    CHECK_EQ_U(p.samples, TIA_READER_EDGE_SAMPLES, "dos flancos: 64 muestras por rafaga");
+    CHECK_EQ_U(TIA_READER_BUF_SAMPLES, 2048U, "buffer de 2048 muestras (4 KB)");
+    CHECK_EQ_U(TIA_READER_EDGE_BURSTS, 4U, "4 rafagas por periodo en modo flancos");
+
+    p = TiaReader_PlanFor(2615U);
+    CHECK(p.mode == TIA_PLAN_PERIOD && p.samples <= TIA_READER_BUF_SAMPLES, "2615 Hz: aun cabe un periodo");
+    CHECK_EQ_U(p.samples, 2048U, "2615 Hz: 2040 muestras/periodo + 8 = buffer completo");
+    p = TiaReader_PlanFor(2614U);
+    CHECK(p.mode == TIA_PLAN_EDGES, "2614 Hz: ya no cabe -> rafagas por disparo");
+    CHECK_EQ_U(p.samples, TIA_READER_EDGE_SAMPLES, "modo flancos: 64 muestras por rafaga");
 
     p = TiaReader_PlanFor(1U);
-    CHECK(p.mode == TIA_PLAN_TWO_EDGES, "1 Hz -> dos flancos");
+    CHECK(p.mode == TIA_PLAN_EDGES, "1 Hz -> rafagas por disparo");
 
     /* Barrido: una rafaga de periodo siempre cubre >= 1 periodo y cabe */
     int bad = 0;
@@ -96,9 +102,9 @@ static void test_plan(void)
         TiaPlan_t q = TiaReader_PlanFor(f);
         if (q.mode == TIA_PLAN_PERIOD) {
             if ((uint64_t)q.samples * f < TIA_READER_FS_HZ || q.samples > TIA_READER_BUF_SAMPLES) bad++;
-        } else if (q.mode == TIA_PLAN_TWO_EDGES) {
-            /* el semiperiodo debe ser mayor que la rafaga corta */
-            if ((uint64_t)TIA_READER_EDGE_SAMPLES * 2U * f >= TIA_READER_FS_HZ) bad++;
+        } else if (q.mode == TIA_PLAN_EDGES) {
+            /* T/4 (separacion entre disparos) debe ser mayor que la rafaga corta */
+            if ((uint64_t)TIA_READER_EDGE_SAMPLES * 4U * f >= TIA_READER_FS_HZ) bad++;
         } else {
             bad++;
         }
@@ -109,14 +115,14 @@ static void test_plan(void)
 static void test_rotation(void)
 {
     printf("[test] rotacion de canales\n");
-    static const uint8_t expect[] = { 1, 5, 2, 6, 3, 7, 4, 8, 1 };
+    static const uint8_t expect[] = { 1, 2, 3, 4, 5, 6, 7, 8, 1 };
     uint8_t ch = 0U;
     int bad = 0;
     for (unsigned i = 0; i < sizeof(expect); i++) {
         ch = TiaReader_NextChannel(ch, 0xFFU);
         if (ch != expect[i]) bad++;
     }
-    CHECK_EQ_U(bad, 0, "mascara completa: 1,5,2,6,3,7,4,8,1");
+    CHECK_EQ_U(bad, 0, "mascara completa: 1,2,3,4,5,6,7,8,1");
 
     uint8_t m = (uint8_t)((1U << 1) | (1U << 6));   /* canales 2 y 7 */
     CHECK_EQ_U(TiaReader_NextChannel(0, m), 2, "mascara {2,7}: empieza en 2");
@@ -136,7 +142,7 @@ static void test_period_mode(void)
     TiaReader_Start(0xFFU);
     CHECK_EQ_U(g_spy.starts, 0, "Start no arma por si mismo");
 
-    static const int order[] = { 1, 5, 2, 6, 3, 7, 4, 8 };
+    static const int order[] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     int bad_ch = 0, bad_bank = 0, bad_len = 0;
     for (int r = 0; r < 16; r++) {
         step_ms();
@@ -151,7 +157,7 @@ static void test_period_mode(void)
         TiaReader_Task();   /* mismo ms: no debe armar otro */
     }
     CHECK_EQ_U(g_spy.starts, 16, "un armado por ms, nunca dos en el mismo ms");
-    CHECK_EQ_U(bad_ch, 0, "orden de canales 1,5,2,6,3,7,4,8");
+    CHECK_EQ_U(bad_ch, 0, "orden de canales 1,2,3,4,5,6,7,8");
     CHECK_EQ_U(bad_bank, 0, "disparo TIM1 para 1-4 y TIM8 para 5-8");
     CHECK_EQ_U(bad_len, 0, "rafaga de 62 muestras");
     CHECK_EQ_U(g_spy.stops, 16, "ADC parado tras cada rafaga");
@@ -193,31 +199,73 @@ static void test_bank_stopped(void)
     CHECK_EQ_U(g_spy.starts, 0, "ambos bancos parados: no se arma nada");
 }
 
-static void test_two_edges(void)
+static void test_edges(void)
 {
-    printf("[test] modo dos flancos (1 kHz)\n");
+    printf("[test] modo flancos (1 kHz, 4 rafagas por periodo)\n");
     reset_reader(1000U, 1000U);
     TiaReader_Start(0x01U);   /* solo canal 1 */
     step_ms();
     CHECK_EQ_U(g_spy.starts, 1, "primera rafaga armada");
     CHECK_EQ_U(g_spy.len, 64U, "64 muestras");
     int sel = g_spy.mux_selects;
+    TiaWindow_t w;
 
+    /* Secuencia de un periodo (el primer disparo puede caer en cualquier
+     * punto del pulso): reposo, fase positiva, reposo, fase negativa. */
+    TiaSpy_FillBurst(2040, 2060);       /* reposo (VBIAS) */
+    TiaReader_OnBurstComplete();
+    CHECK_EQ_U(g_spy.starts, 2, "la ISR rearma para el disparo siguiente (2/4)");
     TiaSpy_FillBurst(2500, 2600);       /* fase positiva */
     TiaReader_OnBurstComplete();
-    CHECK_EQ_U(g_spy.starts, 2, "la ISR rearma para el flanco siguiente");
-    CHECK_EQ_U(g_spy.mux_selects, sel, "sin tocar el mux entre las dos fases");
+    CHECK_EQ_U(g_spy.starts, 3, "la ISR rearma para el disparo siguiente (3/4)");
+    TiaSpy_FillBurst(2040, 2060);       /* reposo (VBIAS) */
+    TiaReader_OnBurstComplete();
+    CHECK_EQ_U(g_spy.starts, 4, "la ISR rearma para el disparo siguiente (4/4)");
+    CHECK_EQ_U(g_spy.mux_selects, sel, "sin tocar el mux entre las cuatro rafagas");
 
-    TiaWindow_t w;
     TiaReader_TakeWindow(&w);
-    CHECK_EQ_U(w.count[0], 0, "tras la primera fase aun no hay medida");
+    CHECK_EQ_U(w.count[0], 0, "tras tres rafagas aun no hay medida");
 
     TiaSpy_FillBurst(1500, 1600);       /* fase negativa */
     TiaReader_OnBurstComplete();
+    CHECK_EQ_U(g_spy.starts, 4, "tras la cuarta rafaga no se rearma en la ISR");
     TiaReader_TakeWindow(&w);
-    CHECK_EQ_U(w.count[0], 1, "tras la segunda fase, una medida");
-    CHECK_EQ_U(w.sum_max[0], 2600, "maximo de las dos fases");
-    CHECK_EQ_U(w.sum_min[0], 1500, "minimo de las dos fases");
+    CHECK_EQ_U(w.count[0], 1, "tras la cuarta rafaga, una medida");
+    CHECK_EQ_U(w.sum_max[0], 2600, "maximo de las cuatro rafagas");
+    CHECK_EQ_U(w.sum_min[0], 1500, "minimo de las cuatro rafagas");
+
+    /* Segundo periodo: el acumulado parcial del primero no debe arrastrarse */
+    step_ms();
+    CHECK_EQ_U(g_spy.starts, 5, "el siguiente periodo lo arma Task");
+    for (int k = 0; k < 4; k++) {
+        TiaSpy_FillBurst(2040, 2060);
+        TiaReader_OnBurstComplete();
+    }
+    TiaReader_TakeWindow(&w);
+    CHECK_EQ_U(w.count[0], 1, "segundo periodo: una medida");
+    CHECK_EQ_U(w.sum_max[0], 2060, "sin arrastre del maximo del periodo anterior");
+    CHECK_EQ_U(w.sum_min[0], 2040, "sin arrastre del minimo del periodo anterior");
+
+    /* Fallo de rearme a mitad de periodo: la medida se descarta */
+    step_ms();
+    TiaSpy_FillBurst(2500, 2600);
+    TiaReader_OnBurstComplete();                  /* 1/4, rearma */
+    g_spy.start_ret = HAL_ERROR;
+    TiaSpy_FillBurst(1500, 1600);
+    TiaReader_OnBurstComplete();                  /* 2/4, el rearme falla */
+    g_spy.start_ret = HAL_OK;
+    TiaReader_TakeWindow(&w);
+    CHECK_EQ_U(w.count[0], 0, "rearme fallido a mitad de periodo: medida descartada");
+    step_ms();                                    /* Task arma un periodo nuevo */
+    for (int k = 0; k < 4; k++) {
+        TiaSpy_FillBurst(2040, 2060);
+        TiaReader_OnBurstComplete();
+    }
+    TiaReader_TakeWindow(&w);
+    CHECK_EQ_U(w.count[0], 1, "tras el fallo, el siguiente periodo se mide entero");
+    CHECK_EQ_U(w.sum_max[0], 2060, "sin restos de la medida descartada (maximo)");
+    CHECK_EQ_U(w.sum_min[0], 2040, "sin restos de la medida descartada (minimo)");
+    CHECK_EQ_U(g_spy.irq_depth, 0, "secciones criticas equilibradas");
 }
 
 static void test_timeout(void)
@@ -232,12 +280,12 @@ static void test_timeout(void)
     step_ms();
     CHECK_EQ_U(g_spy.stops, stops + 1, "a los 22 ms se aborta");
     step_ms();
-    CHECK_EQ_U(g_spy.arm_ch[g_spy.starts - 1], 5, "y se pasa al canal siguiente");
-    TiaReader_OnBurstComplete();      /* completa el canal 5 */
+    CHECK_EQ_U(g_spy.arm_ch[g_spy.starts - 1], 2, "y se pasa al canal siguiente");
+    TiaReader_OnBurstComplete();      /* completa el canal 2 */
     TiaWindow_t w;
     TiaReader_TakeWindow(&w);
     CHECK_EQ_U(w.count[0], 0, "el canal abortado no acumula");
-    CHECK_EQ_U(w.count[4], 1, "el siguiente si");
+    CHECK_EQ_U(w.count[1], 1, "el siguiente si");
 }
 
 static void test_pause_stop(void)
@@ -274,7 +322,7 @@ static void test_pause_stop(void)
     step_ms();
     TiaReader_OnBurstComplete();
     TiaReader_TakeWindow(&w);
-    CHECK_EQ_U(w.count[0] + w.count[4], 0, "Start_DMA fallido: nada acumulado");
+    CHECK_EQ_U(w.count[0] + w.count[1], 0, "Start_DMA fallido: nada acumulado");
     g_spy.start_ret = HAL_OK;
     step_ms();
     CHECK(g_spy.starts > 1, "se reintenta en el siguiente ms");
@@ -321,7 +369,7 @@ int main(void)
     test_rotation();
     test_period_mode();
     test_bank_stopped();
-    test_two_edges();
+    test_edges();
     test_timeout();
     test_pause_stop();
     test_current_log();

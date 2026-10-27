@@ -1,16 +1,20 @@
 /**
  ******************************************************************************
  * @file    dac_waveform.c
- * @brief   Generacion de la onda cuadrada de estimulacion por DAC + DMA.
+ * @brief   Generacion del pulso bifasico con reposo de estimulacion por
+ *          DAC + DMA.
  ******************************************************************************
  */
 #include "dac_waveform.h"
 
-/* Buffer circular de 2 muestras por banco: el DMA vuelca alternativamente
- * HIGH y LOW en cada disparo del timer, dando una onda cuadrada de 50% de
- * duty cuya frecuencia es la mitad de la frecuencia de disparo. */
-static uint32_t s_bufferA[2] = { DAC_CODE_HIGH, DAC_CODE_LOW };
-static uint32_t s_bufferB[2] = { DAC_CODE_HIGH, DAC_CODE_LOW };
+/* Buffer circular de DAC_WAVE_SAMPLES = 4 muestras por banco: el DMA vuelca
+ * una muestra en cada disparo del timer, de modo que el periodo de la onda
+ * son 4 disparos y la frecuencia de disparo es 4 veces la de la onda:
+ *   HIGH (T/4)  ->  LOW (T/4)  ->  MID (T/4)  ->  MID (T/4)
+ * es decir, fase positiva de T/4, fase negativa de T/4 y reposo en VBIAS
+ * durante T/2 (pulso bifasico con reposo de Martin et al., 2024). */
+static uint32_t s_bufferA[DAC_WAVE_SAMPLES] = { DAC_CODE_HIGH, DAC_CODE_LOW, DAC_CODE_MID, DAC_CODE_MID };
+static uint32_t s_bufferB[DAC_WAVE_SAMPLES] = { DAC_CODE_HIGH, DAC_CODE_LOW, DAC_CODE_MID, DAC_CODE_MID };
 
 typedef struct {
     TIM_HandleTypeDef *htim;
@@ -46,9 +50,12 @@ static void ParkBank(DacBankState_t *st)
     st->running = false;
 }
 
-/* Mismo buscador de (prescaler, autorecarga) que en la version anterior
- * del driver de frecuencia -- ver justificacion en el historial del
- * proyecto. Trabaja sobre la frecuencia de DISPARO (2x la de la onda). */
+/* Buscador de (prescaler, autorecarga): toma el menor prescaler para el que
+ * ARR+1 cabe en 16 bits. Trabaja sobre la frecuencia de DISPARO (4x la de la
+ * onda, DAC_WAVE_SAMPLES). ARR+1 se redondea al entero mas proximo (no se
+ * trunca): con 4 disparos por periodo, a 300 kHz ARR+1 vale solo ~100 y el
+ * truncado llegaria a ~1 % de error de frecuencia; redondeando queda en
+ * <= 0,5 %. */
 static bool ComputeTimerParams(uint32_t trigger_freq_hz, uint32_t *out_psc, uint32_t *out_arr)
 {
     if (trigger_freq_hz == 0U) {
@@ -59,7 +66,7 @@ static bool ComputeTimerParams(uint32_t trigger_freq_hz, uint32_t *out_psc, uint
         if (divisor == 0U) {
             continue;
         }
-        uint32_t arr_plus_1 = DAC_TRIGGER_CLOCK_HZ / divisor;
+        uint32_t arr_plus_1 = (DAC_TRIGGER_CLOCK_HZ + divisor / 2U) / divisor;
         if (arr_plus_1 == 0U) {
             continue;
         }
@@ -116,7 +123,7 @@ HAL_StatusTypeDef DacWaveform_SetFrequency(DacBank_t bank, uint32_t freq_hz)
     }
 
     uint32_t psc, arr;
-    if (!ComputeTimerParams(freq_hz * 2U, &psc, &arr)) {
+    if (!ComputeTimerParams(freq_hz * DAC_WAVE_SAMPLES, &psc, &arr)) {
         return HAL_ERROR;
     }
 
@@ -133,8 +140,8 @@ HAL_StatusTypeDef DacWaveform_SetFrequency(DacBank_t bank, uint32_t freq_hz)
     __HAL_TIM_SET_AUTORELOAD(st->htim, arr);
     __HAL_TIM_SET_COUNTER(st->htim, 0U);
 
-    HAL_StatusTypeDef status = HAL_DAC_Start_DMA(s_hdac, st->dac_channel, st->buffer, 2U,
-                                                   DAC_ALIGN_12B_R);
+    HAL_StatusTypeDef status = HAL_DAC_Start_DMA(s_hdac, st->dac_channel, st->buffer,
+                                                   DAC_WAVE_SAMPLES, DAC_ALIGN_12B_R);
     if (status != HAL_OK) {
         ParkBank(st); /* no dejar el canal deshabilitado (salida flotante) */
         return status;

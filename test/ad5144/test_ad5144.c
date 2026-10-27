@@ -264,10 +264,10 @@ static double model_out_mv(uint8_t code, double in_peak_mv, double rab, double r
     return in_peak_mv * raw / (double)AD5144_RIN_OHM;
 }
 
-/* Excursion de Dif con la que trabaja la placa: 690 codigos de DAC con
- * VREF = 3,3 V -> 556 mV (DAC_DIF_PEAK_MV en dac_waveform.h). Se copia el
+/* Excursion de Dif con la que trabaja la placa: 621 codigos de DAC con
+ * VREF = 3,3 V -> 500 mV (DAC_DIF_PEAK_MV en dac_waveform.h). Se copia el
  * numero aqui porque el arnes no enlaza dac_waveform. */
-#define BOARD_IN_PEAK_MV  (556U)
+#define BOARD_IN_PEAK_MV  (500U)
 
 static void test_set_channel_millivolts(void)
 {
@@ -296,17 +296,17 @@ static void test_set_channel_millivolts(void)
     CHECK(AD5144_CodeForMillivolts(2000U, BOARD_IN_PEAK_MV, &c2000) == HAL_OK, "2000 mV alcanzable");
     CHECK(c500 > c1000 && c1000 > c2000, "codigo decrece al subir la amplitud");
 
-    /* Puntos calculados a mano (R_AB 10k, R_W 125, R_IN 2k5, in_peak 556):
-     *   1000 mV: R_AW = 4496,4 -> (4371,4)*256/10000 = 111,9 -> 112 -> D = 144
-     *   2000 mV: R_AW = 8992,8 -> (8867,8)*256/10000 = 227,0 -> 227 -> D = 29 */
-    CHECK_EQ_U(c1000, 144U, "1000 mV con in_peak 556 -> D = 144");
-    CHECK_EQ_U(c2000, 29U,  "2000 mV con in_peak 556 -> D = 29");
+    /* Puntos calculados a mano (R_AB 10k, R_W 55, R_IN 2k5, in_peak 500):
+     *   1000 mV: R_AW = 5000,0 -> (4945,0)*256/10000 = 126,6 -> 127 -> D = 129
+     *   2000 mV: R_AW = 10000  -> (9945,0)*256/10000 = 254,6 -> 255 -> D = 1 */
+    CHECK_EQ_U(c1000, 129U, "1000 mV con in_peak 500 -> D = 129");
+    CHECK_EQ_U(c2000, 1U,   "2000 mV con in_peak 500 -> D = 1");
 
     /* --- 0 mV y por debajo del minimo alcanzable -> posicion segura 255 --- */
     CHECK(AD5144_CodeForMillivolts(0U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "0 mV -> HAL_OK");
     CHECK_EQ_U(code, AD5144_CODE_MIN_GAIN, "0 mV -> codigo 255 (ganancia minima)");
     CHECK(AD5144_CodeForMillivolts(5U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "5 mV -> HAL_OK");
-    CHECK_EQ_U(code, AD5144_CODE_MIN_GAIN, "5 mV (< minimo ~36 mV) -> codigo 255");
+    CHECK_EQ_U(code, AD5144_CODE_MIN_GAIN, "5 mV (< minimo ~19 mV) -> codigo 255");
 
     /* --- Inalcanzable (mas ganancia de la que hay) -> HAL_ERROR, sin bus --- */
     init_ok(&dev, &hi2c, ADDR_U2);
@@ -317,23 +317,23 @@ static void test_set_channel_millivolts(void)
     CHECK_EQ_U(dev.shadow[AD5144_CH_B], 0x77U, "objetivo inalcanzable: shadow intacto");
 
     /* Limite exacto: el maximo alcanzable con D = 0 es in_peak*(R_AB+R_W)/R_IN.
-     * Con in_peak 556: 556*10125/2500 = 2251,8 mV. 2251 -> D = 0; 2300 -> error. */
-    CHECK(AD5144_CodeForMillivolts(2251U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "2251 mV justo alcanzable");
-    CHECK_EQ_U(code, 0U, "2251 mV -> D = 0 (ganancia maxima)");
+     * Con in_peak 500: 500*10055/2500 = 2011 mV. 2011 -> D = 0; 2300 -> error. */
+    CHECK(AD5144_CodeForMillivolts(2011U, BOARD_IN_PEAK_MV, &code) == HAL_OK, "2011 mV justo alcanzable");
+    CHECK_EQ_U(code, 0U, "2011 mV -> D = 0 (ganancia maxima)");
     CHECK(AD5144_CodeForMillivolts(2300U, BOARD_IN_PEAK_MV, &code) == HAL_ERROR, "2300 mV -> HAL_ERROR");
 
     /* --- Trama completa de un SetChannelMillivolts valido --- */
     init_ok(&dev, &hi2c, ADDR_U1);
     CHECK(AD5144_SetChannelMillivolts(&dev, AD5144_CH_C, 1000U, BOARD_IN_PEAK_MV) == HAL_OK,
           "SetChannelMillivolts 1000 mV -> HAL_OK");
-    expect_frame(0, ADDR_U1, 0x12U, 144U, "canal C @ 1000 mV");
-    CHECK_EQ_U(dev.shadow[AD5144_CH_C], 144U, "shadow = 144");
+    expect_frame(0, ADDR_U1, 0x12U, 129U, "canal C @ 1000 mV");
+    CHECK_EQ_U(dev.shadow[AD5144_CH_C], 129U, "shadow = 129");
 
     /* --- Barrido 0..2000 mV en pasos de 1 mV, tres excursiones de entrada.
      *     Para cada punto alcanzable por encima del minimo se comprueba,
      *     contra el modelo en doble precision, que el codigo elegido deja la
      *     salida a no mas de medio paso del objetivo. --- */
-    static const uint16_t peaks[] = { BOARD_IN_PEAK_MV, 500U, 700U };
+    static const uint16_t peaks[] = { BOARD_IN_PEAK_MV, 400U, 700U };
     unsigned long pts = 0UL;
     int err_ret = 0, err_round = 0, err_mono = 0;
     double worst_step = 0.0;
@@ -357,7 +357,7 @@ static void test_set_channel_millivolts(void)
             pts++;
         }
     }
-    printf("   barrido mV->code: %lu puntos, paso con in_peak 556 mV = %.2f mV\n", pts, worst_step);
+    printf("   barrido mV->code: %lu puntos, paso con in_peak 500 mV = %.2f mV\n", pts, worst_step);
     CHECK(pts > 5000UL, "el barrido cubre miles de puntos");
     CHECK_EQ_U(err_ret, 0,   "todo objetivo <= maximo alcanzable devuelve HAL_OK");
     CHECK_EQ_U(err_mono, 0,  "el codigo es monotono decreciente con el objetivo");
@@ -365,12 +365,18 @@ static void test_set_channel_millivolts(void)
     CHECK(worst_step < 10.0, "resolucion con la excursion de la placa < 10 mV/paso");
 
     /* --- Margen de diseno con la tolerancia de R_AB (+/-8 %) y la excursion
-     *     de la placa: con R_AB -8 % aun se alcanzan 2 V; con R_AB +8 % y
-     *     D = 0 la salida no supera los 2,5 V de los terminales del AD5144. */
+     *     de la placa (+/-0,5 V, memoria de la etapa analogica): nominal, el
+     *     codigo 0 da ~2,01 V; con R_AB -8 % sin calibrar quedan ~1,85 V, es
+     *     decir, ~7,5 % por debajo de 2 V (dentro del ~15 % de error sin
+     *     calibrar de la memoria); con R_AB +8 % y D = 0 la salida no supera
+     *     los 2,5 V de los terminales del AD5144. --- */
+    double vmax_nom  = model_out_mv(0U, BOARD_IN_PEAK_MV, AD5144_RAB_OHM, AD5144_RW_OHM);
     double vmax_low  = model_out_mv(0U, BOARD_IN_PEAK_MV, AD5144_RAB_OHM * 0.92, 55.0);
     double vmax_high = model_out_mv(0U, BOARD_IN_PEAK_MV, AD5144_RAB_OHM * 1.08, 125.0);
-    printf("   salida con D = 0: %.0f mV (R_AB -8 %%), %.0f mV (R_AB +8 %%)\n", vmax_low, vmax_high);
-    CHECK(vmax_low  >= 2000.0, "R_AB -8 %: 2 V siguen siendo alcanzables");
+    printf("   salida con D = 0: %.0f mV nominal, %.0f mV (R_AB -8 %%), %.0f mV (R_AB +8 %%)\n",
+           vmax_nom, vmax_low, vmax_high);
+    CHECK(vmax_nom  >= 2000.0, "nominal: 2 V alcanzables con D = 0 (~2,01 V)");
+    CHECK(vmax_low  >= 2000.0 * 0.85, "R_AB -8 %: a lo sumo 15 % por debajo de 2 V sin calibrar");
     CHECK(vmax_high <= 2500.0, "R_AB +8 %: D = 0 no saca los terminales de +/-2,5 V");
 }
 

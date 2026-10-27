@@ -1,15 +1,26 @@
 /**
  ******************************************************************************
  * @file    dac_waveform.h
- * @brief   Generacion de la onda cuadrada de estimulacion por DAC + DMA.
+ * @brief   Generacion del pulso bifasico con reposo de estimulacion por
+ *          DAC + DMA.
  *
  * El DAC1 del STM32L4R5 (un unico periferico, dos canales: DAC1_OUT1 para
  * el banco A -canales de cultivo 1-4-, DAC1_OUT2 para el banco B -canales
- * 5-8-) genera directamente la onda cuadrada de cada banco. Es el uso
- * estandar de un DAC con disparo por timer y volcado circular por DMA,
- * el mismo mecanismo que ya validaba el firmware de pruebas antiguo
- * (DAC_RTC_L4), aqui generalizado a frecuencia configurable en lugar de
- * fija a 100 Hz.
+ * 5-8-) genera directamente el pulso de cada banco. Es el uso estandar de
+ * un DAC con disparo por timer y volcado circular por DMA, el mismo
+ * mecanismo que ya validaba el firmware de pruebas antiguo (DAC_RTC_L4),
+ * aqui generalizado a frecuencia configurable en lugar de fija a 100 Hz.
+ *
+ * FORMA DE ONDA (alineada con la memoria de la etapa analogica, apartados
+ * 6.1 y 7.8, y con Martin et al., 2024): pulso bifasico con reposo.
+ * Periodo T = 4 disparos del timer, una muestra del DAC por disparo:
+ *
+ *     DAC_CODE_HIGH (T/4)  ->  DAC_CODE_LOW (T/4)  ->  DAC_CODE_MID (T/2)
+ *
+ * fase positiva de T/4, fase negativa de T/4 de igual amplitud, y reposo en
+ * VBIAS (Dif = 0) durante el medio periodo restante. A 100 kHz cada fase
+ * dura 2,5 us. El timer de disparo corre a DAC_WAVE_SAMPLES (4) veces la
+ * frecuencia de la onda.
  *
  * El DAC fija la amplitud de ENTRADA comun del banco: oscila siempre
  * entre DAC_CODE_LOW y DAC_CODE_HIGH, simetrico respecto a VBIAS. La
@@ -25,11 +36,12 @@
  *
  * LIMITACION FISICA CONOCIDA Y ACEPTADA (ver capitulo de Requisitos de
  * diseno de la memoria): el tiempo de asentamiento del DAC del STM32L4
- * (~1.6-4 us segun modo/carga) hace que su uso limpio este en torno a los
- * 100 kHz, que es precisamente la frecuencia mas usada segun el
- * investigador. El limite superior de 300 kHz se admite como caso
- * extremo poco frecuente; a esa frecuencia la onda puede salir mas
- * redondeada que cuadrada.
+ * (~1.6-4 us segun modo/carga; cifra no verificada contra el datasheet)
+ * es comparable a la duracion de cada fase, T/4 = 2,5 us a 100 kHz, que
+ * es precisamente la frecuencia mas usada segun el investigador. A
+ * 100 kHz los flancos pueden salir redondeados, y a 300 kHz (fase de
+ * 0,83 us, caso extremo poco frecuente) el DAC no llega a asentarse y el
+ * pulso sale mas redondeado que cuadrado. Pendiente de comprobar en placa.
  ******************************************************************************
  */
 #ifndef BSP_INC_DAC_WAVEFORM_H_
@@ -55,6 +67,10 @@ typedef enum {
 #define DAC_FREQ_MIN_HZ        (1UL)
 #define DAC_FREQ_MAX_HZ        (300000UL)
 
+/* Muestras del buffer circular por periodo de la onda (HIGH, LOW, MID,
+ * MID). La frecuencia de disparo del timer es DAC_WAVE_SAMPLES * f. */
+#define DAC_WAVE_SAMPLES       (4U)
+
 /* Codigos de 12 bits de la onda (revision de esquematicos de octubre de
  * 2026). La etapa diferencial de ESA (OPA2172 + LT5400-4, 4 x 1 kOhm,
  * relacion 1:1) entrega Dif = VBIAS - DAC_OUT, y VBIAS = VREF/2 sale del
@@ -63,29 +79,33 @@ typedef enum {
  * (diseno ratiometrico): DAC_CODE_MID = 2048.
  *
  * La excursion +/-DAC_SWING_CODES fija la amplitud de pico de Dif que
- * despues amplifica cada canal (ganancia R_AW/2,5 kOhm, ver ad5144.h):
- *   - techo: con D = 0 y R_AB en +8 % (ganancia 4,37) la salida no debe
- *     pasar de los +/-2,5 V que admiten los terminales del AD5144
- *     -> excursion <= 0,572 V (710 codigos).
- *   - suelo: con R_AB en -8 % (ganancia max. 3,70) aun deben alcanzarse
- *     2 V de pico -> excursion >= 0,540 V (671 codigos).
- * 690 codigos (0,556 V con VREF = 3,3 V) cumple ambos; resolucion por
- * canal ~8,7 mV/paso, por debajo de los 10 mV pedidos.
- * Pendiente de confirmar: si los "0-2 V" del requisito son de pico (lo que
- * aqui se asume) o pico a pico. */
+ * despues amplifica cada canal (ganancia R_AW/2,5 kOhm, ver ad5144.h). La
+ * memoria de la etapa analogica (apartados 7.8 y 7.14) fija el pulso en
+ * 1,15 V / 2,15 V alrededor de VBIAS = 1,65 V, es decir +/-0,5 V. Con
+ * VREF = 3,3 V, 0,5 V son 620,6 codigos; se toman 621 (0,5005 V), de modo
+ * que los niveles reales del DAC son 2,1505 V y 1,1495 V. Con ello:
+ *   - resolucion por canal: 0,5 V * (R_AB/256)/2,5 kOhm = 7,81 mV/paso;
+ *   - amplitud activa minima (D = 255): ~18,8 mV; maxima (D = 0): ~2,01 V.
+ * Sin calibrar, R_AB (+/-8 %) y R_W hacen que la amplitud real se desvie
+ * hasta ~15 % de la pedida (con R_AB -8 % y D = 0 salen ~1,85 V en lugar
+ * de 2 V); la calibracion por canal de la validacion en placa corrige
+ * parte de esa desviacion. Con R_AB +8 % y D = 0 la salida queda en
+ * ~2,19 V, por debajo de los +/-2,5 V que admiten los terminales del
+ * AD5144. La amplitud pedida (0-2 V) es de PICO por fase, como indica la
+ * memoria (|Vestim| = Ganancia(D) * 0,5 V). */
 #define DAC_VREF_MV            (3300U)
 #define DAC_CODE_MID           (2048U)
-#define DAC_SWING_CODES        (690U)
+#define DAC_SWING_CODES        (621U)
 #define DAC_CODE_HIGH          (DAC_CODE_MID + DAC_SWING_CODES)
 #define DAC_CODE_LOW           (DAC_CODE_MID - DAC_SWING_CODES)
 
 /* Amplitud de pico de Dif en mV (redondeada) para la conversion
- * mV -> codigo del AD5144: 690 * 3300 / 4096 = 555,9 -> 556 mV. */
+ * mV -> codigo del AD5144: 621 * 3300 / 4096 = 500,3 -> 500 mV. */
 #define DAC_DIF_PEAK_MV        ((uint16_t)(((uint32_t)DAC_SWING_CODES * DAC_VREF_MV + 2048U) / 4096U))
 
 /**
  * @brief  Vincula los handles de DAC/timer generados por CubeMX, prepara
- *         el buffer circular de 2 muestras por banco y deja ambos bancos
+ *         el buffer circular de 4 muestras por banco y deja ambos bancos
  *         detenidos (0 Hz) y APARCADOS en DAC_CODE_MID (Dif = 0) hasta que
  *         se pida una frecuencia explicita.
  */
@@ -94,8 +114,8 @@ HAL_StatusTypeDef DacWaveform_Init(DAC_HandleTypeDef *hdac,
                                     TIM_HandleTypeDef *htim_bank_b);
 
 /**
- * @brief  Arranca (o reconfigura en caliente) la onda cuadrada de un banco
- *         a la frecuencia pedida. freq_hz = 0 detiene el banco.
+ * @brief  Arranca (o reconfigura en caliente) el pulso bifasico con reposo
+ *         de un banco a la frecuencia pedida. freq_hz = 0 detiene el banco.
  *         Fuera de [DAC_FREQ_MIN_HZ, DAC_FREQ_MAX_HZ] devuelve HAL_ERROR
  *         sin modificar el estado anterior.
  */

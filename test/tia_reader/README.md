@@ -17,17 +17,17 @@ mano, rellenando el buffer que recibió `HAL_ADC_Start_DMA` y llamando a
 bash test/tia_reader/build_and_run.sh
 ```
 
-Salida esperada: `=== 71 comprobaciones, 0 fallos ===` / `RESULTADO: OK`.
+Salida esperada: `=== 86 comprobaciones, 0 fallos ===` / `RESULTADO: OK`.
 
 ## Qué se cubre
 
 | Bloque | Comprobación |
 |---|---|
-| Plan de medida | 0 Hz → no se mide; 100 kHz → ráfaga de 62 muestras (un periodo + 8); 300 kHz → 26; límite exacto 5250/5249 Hz entre «un periodo» y «dos flancos»; barrido 1 Hz–300 kHz: la ráfaga siempre cubre el periodo y cabe en el buffer, y en «dos flancos» el semiperiodo es mayor que la ráfaga |
-| Rotación | 1,5,2,6,3,7,4,8 con máscara completa y parcial |
+| Plan de medida | 0 Hz → no se mide; 100 kHz → ráfaga de 62 muestras (un periodo + 8); 300 kHz → 26; límite exacto 2615/2614 Hz entre «un periodo» (buffer de 2048 muestras) y «flancos»; barrido 1 Hz–300 kHz: la ráfaga siempre cubre el periodo y cabe en el buffer, y en «flancos» el cuarto de periodo (separación entre disparos) es mayor que la ráfaga |
+| Rotación | 1,2,…,8 con máscara completa y parcial |
 | Modo periodo | un armado por ms como máximo; disparo TIM1 para 1–4 y TIM8 para 5–8; mux cambiado y espera de asentamiento antes de cada armado; máximo y mínimo acumulados por canal; `TakeWindow` vacía el acumulado |
 | Banco parado | sus canales se saltan; con los dos parados no se arma nada |
-| Dos flancos | la interrupción rearma para el flanco siguiente sin tocar el mux; se combinan los picos de las dos fases |
+| Flancos (baja frecuencia) | cuatro ráfagas por periodo (pulso bifasico con reposo): la interrupción rearma para el disparo siguiente sin tocar el mux; se combinan el máximo y el mínimo de las cuatro; sin arrastre entre periodos; un rearme fallido a mitad de periodo descarta la medida |
 | Ráfaga que no llega | se aborta a los 2 periodos + 20 ms y se pasa al canal siguiente, sin acumular |
 | Pausa / parada | la pausa aborta la ráfaga pendiente; interrupción tardía ignorada; parado no arma y deshabilita el MAX4581; fallo de `HAL_ADC_Start_DMA` se reintenta |
 | `current_log` | (I⁺ − I⁻)/2 ≈ 1000 µA para ±1266 códigos; un desplazamiento común no afecta; la ganancia de calibración se aplica y el offset se cancela; canal sin medidas → NaN; registro little‑endian (`1.0f` = `00 00 80 3F`, NaN = `00 00 C0 7F`) |

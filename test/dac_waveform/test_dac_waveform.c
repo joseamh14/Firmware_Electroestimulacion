@@ -5,10 +5,11 @@
  *          BSP/Src/dac_waveform.c.
  *
  * La funcion ComputeTimerParams() es aritmetica pura: a partir de una
- * frecuencia de DISPARO (2x la de la onda, por las 2 muestras/periodo del
- * buffer DMA) busca el par (prescaler, autorecarga) que mejor la aproxima
- * sin que ARR+1 se salga de 16 bits. No toca ningun registro, asi que se
- * prueba sin mocks de comportamiento.
+ * frecuencia de DISPARO (4x la de la onda, por las 4 muestras/periodo del
+ * buffer DMA: pulso bifasico con reposo HIGH, LOW, MID, MID) busca el par
+ * (prescaler, autorecarga) que mejor la aproxima, con ARR+1 redondeado al
+ * entero mas proximo, sin que ARR+1 se salga de 16 bits. No toca ningun
+ * registro, asi que se prueba sin mocks de comportamiento.
  *
  * Como ComputeTimerParams es 'static', el TU de test incluye el .c entero
  * (tecnica habitual para test de funciones internas). Los stubs no-op de
@@ -20,8 +21,8 @@
  * flotante): el error relativo se expresa en ppm (partes por millon).
  *
  * Cubre:
- *   1. Los tres puntos verificados a mano en el Anexo de calculos:
- *      1 Hz -> PSC=915/ARR=65501, 100 kHz -> 0/599, 300 kHz -> 0/199.
+ *   1. Tres puntos de referencia (con 4 disparos por periodo):
+ *      1 Hz -> PSC=457/ARR=65501, 100 kHz -> 0/299, 300 kHz -> 0/99.
  *   2. Limite inferior (1 Hz) y rechazo de 0 Hz (no se interpreta como
  *      "sin division"): salida sin tocar, retorno false.
  *   3. Techo aritmetico exacto sin prescaler (trigger = Fclk -> ARR=0). El
@@ -29,13 +30,13 @@
  *   4. Barrido de toda la banda 1 Hz - 300 kHz: nunca rechaza, ARR/PSC
  *      siempre en 16 bits (no hay desbordamiento silencioso del registro),
  *      error relativo acotado.
- *   5. Barrido por decadas (10/100/1k/10k Hz): error relativo dentro del
- *      orden de magnitud del Anexo (~3e-4 %, es decir ~3 ppm).
+ *   5. Barrido por decadas (10/100/1k/10k Hz): error relativo de pocos ppm.
  *   6. Via API publico DacWaveform_SetFrequency: el par (PSC, ARR) llega al
  *      timer, el limite superior se rechaza sin tocar el estado anterior,
  *      0 Hz para el banco y un fallo de DMA se propaga.
- *   7. Onda centrada en VBIAS y aparcado (revision de esquematicos de
- *      octubre de 2026): codigos 2048 +/- 690, amplitud de Dif de 556 mV;
+ *   7. Pulso bifasico con reposo centrado en VBIAS y aparcado (revision de
+ *      esquematicos de octubre de 2026): buffer de 4 muestras HIGH, LOW, MID,
+ *      MID (T/4, T/4, T/2), codigos 2048 +/- 621, amplitud de Dif de 500 mV;
  *      Init, Stop, 0 Hz y un fallo de DMA dejan el canal HABILITADO en 2048
  *      con el disparo por TRGO desactivado (nunca flotante), y al arrancar
  *      la onda el disparo vuelve a estar activo.
@@ -75,11 +76,11 @@ static uint64_t total_div(uint32_t psc, uint32_t arr)
 
 /* Error relativo (ppm) entre la ONDA que produce (psc, arr) y la frecuencia
  * de onda pedida, con aritmetica entera:
- *   err = |Fclk - 2*f*D| / (2*f*D),   D = (psc+1)*(arr+1)
- * (el timer dispara a Fclk/D y la onda sale a la mitad). */
+ *   err = |Fclk - N*f*D| / (N*f*D),   D = (psc+1)*(arr+1),   N = 4
+ * (el timer dispara a Fclk/D y la onda sale a la cuarta parte). */
 static uint64_t rel_err_ppm(uint32_t wave_hz, uint32_t psc, uint32_t arr)
 {
-    uint64_t den  = 2ULL * (uint64_t)wave_hz * total_div(psc, arr);
+    uint64_t den  = (uint64_t)DAC_WAVE_SAMPLES * (uint64_t)wave_hz * total_div(psc, arr);
     uint64_t fclk = (uint64_t)DAC_TRIGGER_CLOCK_HZ;
     uint64_t num  = (fclk > den) ? (fclk - den) : (den - fclk);
     return (num * 1000000ULL) / den;
@@ -88,35 +89,37 @@ static uint64_t rel_err_ppm(uint32_t wave_hz, uint32_t psc, uint32_t arr)
 /* Frecuencia de onda reconstruida, en milihercios, para los volcados. */
 static uint64_t wave_mhz(uint32_t psc, uint32_t arr)
 {
-    return ((uint64_t)DAC_TRIGGER_CLOCK_HZ * 1000ULL) / (2ULL * total_div(psc, arr));
+    return ((uint64_t)DAC_TRIGGER_CLOCK_HZ * 1000ULL) / ((uint64_t)DAC_WAVE_SAMPLES * total_div(psc, arr));
 }
 
 /* ComputeTimerParams trabaja sobre la frecuencia de DISPARO; este wrapper
  * lo llama en terminos de la frecuencia de ONDA (la que ve el usuario). */
 static bool params_for_wave(uint32_t wave_hz, uint32_t *psc, uint32_t *arr)
 {
-    return ComputeTimerParams(wave_hz * 2U, psc, arr);
+    return ComputeTimerParams(wave_hz * DAC_WAVE_SAMPLES, psc, arr);
 }
 
 /* ================================================================== *
- *  1. Puntos del Anexo de calculos
+ *  1. Puntos de referencia
  * ================================================================== */
 static void test_reference_points(void)
 {
-    printf("[test] puntos verificados a mano (Anexo de calculos)\n");
+    printf("[test] puntos de referencia (4 disparos por periodo)\n");
     uint32_t psc, arr;
 
+    CHECK_EQ_U(DAC_WAVE_SAMPLES, 4U, "4 muestras por periodo (HIGH, LOW, MID, MID)");
+
     CHECK(params_for_wave(1U, &psc, &arr), "1 Hz: calculable");
-    CHECK_EQ_U(psc, 915U,   "1 Hz -> PSC=915");
+    CHECK_EQ_U(psc, 457U,   "1 Hz -> PSC=457");
     CHECK_EQ_U(arr, 65501U, "1 Hz -> ARR=65501");
 
     CHECK(params_for_wave(100000U, &psc, &arr), "100 kHz: calculable");
     CHECK_EQ_U(psc, 0U,   "100 kHz -> PSC=0");
-    CHECK_EQ_U(arr, 599U, "100 kHz -> ARR=599");
+    CHECK_EQ_U(arr, 299U, "100 kHz -> ARR=299 (fase de 2,5 us)");
 
     CHECK(params_for_wave(300000U, &psc, &arr), "300 kHz: calculable");
     CHECK_EQ_U(psc, 0U,   "300 kHz -> PSC=0");
-    CHECK_EQ_U(arr, 199U, "300 kHz -> ARR=199");
+    CHECK_EQ_U(arr, 99U,  "300 kHz -> ARR=99 (fase de 0,83 us)");
 }
 
 /* ================================================================== *
@@ -171,7 +174,7 @@ static void test_band_sweep(void)
 
     for (uint32_t f = DAC_FREQ_MIN_HZ; f <= DAC_FREQ_MAX_HZ; f++) {
         uint32_t psc, arr;
-        if (!ComputeTimerParams(f * 2U, &psc, &arr)) {
+        if (!ComputeTimerParams(f * DAC_WAVE_SAMPLES, &psc, &arr)) {
             rejects++;
             continue;
         }
@@ -185,10 +188,13 @@ static void test_band_sweep(void)
 
     CHECK_EQ_U(rejects, 0,   "ningun rechazo dentro de [1, 300000] Hz");
     CHECK_EQ_U(overflows, 0, "ARR y PSC siempre dentro de 16 bits en toda la banda");
-    /* La resolucion cerca de 300 kHz es de ~0.5 % (ARR ~= 200): el barrido
-     * solo garantiza que el buscador converge y acota el error, no la
-     * exactitud fina -- esa se mide en los puntos de decada. */
-    CHECK(worst_ppm < 6000U, "error relativo de banda acotado (< 6000 ppm)");
+    /* Con ARR+1 redondeado, el error maximo es medio paso del contador:
+     * 0,5/(ARR+1), que a 300 kHz (ARR+1 = 100) llega a 5000 ppm = 0,5 %. Es
+     * el limite del requisito de error de frecuencia < 1 % (tabla 8.2 de la
+     * memoria de la etapa analogica). El barrido solo garantiza que el
+     * buscador converge y acota el error, no la exactitud fina -- esa se
+     * mide en los puntos de decada. */
+    CHECK(worst_ppm <= 5000U, "error relativo de banda <= 5000 ppm (0,5 %)");
     printf("   peor error relativo de banda: %llu ppm en f = %lu Hz\n",
            (unsigned long long)worst_ppm, (unsigned long)worst_f);
 }
@@ -202,9 +208,9 @@ static void test_decade_error(void)
 
     static const uint32_t freqs[] = { 10U, 100U, 1000U, 10000U };
 
-    /* El Anexo cita ~3e-4 %% (~3 ppm) de peor caso sobre puntos con division
-     * exacta (1 Hz / 100 kHz / 300 kHz). El barrido mete 10 Hz, cuyo error
-     * real es ~6 ppm; ambos quedan holgados por debajo de 10 ppm (1e-3 %%). */
+    /* 100 Hz, 1 kHz y 10 kHz dividen exacto; 10 Hz tiene un error real de
+     * ~6 ppm (65217,39 redondeado a 65217). Todos por debajo de 10 ppm
+     * (1e-3 %%). */
     const uint64_t tol_ppm = 10U;
 
     for (size_t i = 0U; i < sizeof(freqs) / sizeof(freqs[0]); i++) {
@@ -251,17 +257,17 @@ static void test_public_api(void)
 
     CHECK(DacWaveform_SetFrequency(DAC_BANK_A, 100000U) == HAL_OK, "SET 100 kHz -> HAL_OK");
     CHECK_EQ_U(s_htimA.PSC, 0U,   "100 kHz -> TIMx->PSC");
-    CHECK_EQ_U(s_htimA.ARR, 599U, "100 kHz -> TIMx->ARR");
+    CHECK_EQ_U(s_htimA.ARR, 299U, "100 kHz -> TIMx->ARR");
     CHECK_EQ_U(s_htimA.CNT, 0U,   "reconfig pone TIMx->CNT a 0");
     CHECK_EQ_U(DacWaveform_GetFrequency(DAC_BANK_A), 100000U, "GetFrequency refleja 100 kHz");
 
     CHECK(DacWaveform_SetFrequency(DAC_BANK_B, 1U) == HAL_OK, "SET 1 Hz -> HAL_OK");
-    CHECK_EQ_U(s_htimB.PSC, 915U,   "1 Hz -> PSC (banco B)");
+    CHECK_EQ_U(s_htimB.PSC, 457U,   "1 Hz -> PSC (banco B)");
     CHECK_EQ_U(s_htimB.ARR, 65501U, "1 Hz -> ARR (banco B)");
 
     CHECK(DacWaveform_SetFrequency(DAC_BANK_A, 300000U) == HAL_OK, "SET 300 kHz -> HAL_OK");
-    CHECK_EQ_U(s_htimA.PSC, 0U,   "300 kHz -> PSC");
-    CHECK_EQ_U(s_htimA.ARR, 199U, "300 kHz -> ARR");
+    CHECK_EQ_U(s_htimA.PSC, 0U,  "300 kHz -> PSC");
+    CHECK_EQ_U(s_htimA.ARR, 99U, "300 kHz -> ARR");
 
     /* Limite superior exacto: 300000 pasa, 300001 se rechaza sin tocar nada. */
     uint32_t psc_prev = s_htimA.PSC;
@@ -302,9 +308,11 @@ static void test_parking(void)
     printf("[test] onda centrada en VBIAS y aparcado del canal\n");
 
     CHECK_EQ_U(DAC_CODE_MID, 2048U, "VBIAS = mitad de escala (ratiometrico)");
-    CHECK_EQ_U(DAC_CODE_HIGH - DAC_CODE_MID, 690U, "excursion positiva 690 codigos");
-    CHECK_EQ_U(DAC_CODE_MID - DAC_CODE_LOW, 690U, "excursion negativa simetrica");
-    CHECK_EQ_U(DAC_DIF_PEAK_MV, 556U, "690 * 3300 / 4096 = 556 mV de pico en Dif");
+    CHECK_EQ_U(DAC_CODE_HIGH - DAC_CODE_MID, 621U, "excursion positiva 621 codigos");
+    CHECK_EQ_U(DAC_CODE_MID - DAC_CODE_LOW, 621U, "excursion negativa simetrica");
+    CHECK_EQ_U(DAC_DIF_PEAK_MV, 500U, "621 * 3300 / 4096 = 500 mV de pico en Dif");
+    CHECK_EQ_U(DAC_CODE_HIGH, 2669U, "nivel alto 2669 (2,15 V con VREF = 3,3 V)");
+    CHECK_EQ_U(DAC_CODE_LOW, 1427U, "nivel bajo 1427 (1,15 V con VREF = 3,3 V)");
 
     dac_setup();
     CHECK(parked(0) && parked(1), "Init: ambos canales aparcados en 2048, habilitados, sin TRGO");
@@ -312,8 +320,19 @@ static void test_parking(void)
     CHECK(DacWaveform_SetFrequency(DAC_BANK_A, 100000U) == HAL_OK, "arranca banco A");
     CHECK(g_hal.ten_at_start_dma[0], "al arrancar la onda, TEN1 vuelve a estar activo");
     CHECK(g_hal.dma[0] && g_hal.en[0], "banco A en marcha por DMA");
-    CHECK(g_hal.dma_len[0] == 2U && g_hal.dma_buf[0][0] == DAC_CODE_HIGH &&
-          g_hal.dma_buf[0][1] == DAC_CODE_LOW, "buffer de 2 muestras HIGH/LOW");
+    CHECK_EQ_U(g_hal.dma_len[0], 4U, "buffer de 4 muestras por periodo");
+    CHECK(g_hal.dma_buf[0][0] == DAC_CODE_HIGH && g_hal.dma_buf[0][1] == DAC_CODE_LOW &&
+          g_hal.dma_buf[0][2] == DAC_CODE_MID  && g_hal.dma_buf[0][3] == DAC_CODE_MID,
+          "pulso bifasico con reposo: HIGH (T/4), LOW (T/4), MID (T/2)");
+    {
+        /* Dif medio nulo: la fase positiva y la negativa se compensan y el
+         * reposo no aporta continua. */
+        int32_t sum = 0;
+        for (uint32_t k = 0U; k < g_hal.dma_len[0]; k++) {
+            sum += (int32_t)g_hal.dma_buf[0][k] - (int32_t)DAC_CODE_MID;
+        }
+        CHECK_EQ_U(sum == 0, 1, "valor medio del pulso = VBIAS (sin continua)");
+    }
     CHECK(parked(1), "el banco B sigue aparcado");
 
     CHECK(DacWaveform_Stop(DAC_BANK_A) == HAL_OK, "Stop banco A");
@@ -322,6 +341,9 @@ static void test_parking(void)
 
     CHECK(DacWaveform_SetFrequency(DAC_BANK_B, 1000U) == HAL_OK, "arranca banco B");
     CHECK(g_hal.ten_at_start_dma[1], "TEN2 activo al arrancar el banco B");
+    CHECK(g_hal.dma_len[1] == 4U && g_hal.dma_buf[1][0] == DAC_CODE_HIGH &&
+          g_hal.dma_buf[1][1] == DAC_CODE_LOW && g_hal.dma_buf[1][2] == DAC_CODE_MID &&
+          g_hal.dma_buf[1][3] == DAC_CODE_MID, "banco B: mismo buffer de 4 muestras");
     CHECK(DacWaveform_SetFrequency(DAC_BANK_B, 0U) == HAL_OK, "0 Hz en banco B");
     CHECK(parked(1), "0 Hz: aparcado en 2048");
 

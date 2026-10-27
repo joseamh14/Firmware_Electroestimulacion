@@ -17,7 +17,7 @@
  *
  * Consecuencias para el firmware:
  *   - La relacion codigo -> amplitud es INVERSA: D = 0 da la ganancia
- *     maxima (~4) y D = 255 la minima (~0,07). No existe codigo que dé 0 V;
+ *     maxima (~4) y D = 255 la minima (~0,04). No existe codigo que dé 0 V;
  *     el 0 V real lo dan el DAC aparcado en VBIAS (dac_waveform) y el
  *     pocillo conmutado a GND (culture_selector).
  *   - La posicion segura del chip es D = 255 (AD5144_CODE_MIN_GAIN), no 0.
@@ -55,11 +55,13 @@ extern "C" {
 #define AD5144_I2C_TIMEOUT_MS      (50U)
 
 /* Parametros de la red resistiva (AD5144ABRUZ10). R_W es el valor tipico
- * de la datasheet (55 ohm min, 125 ohm tip); R_AB tiene una tolerancia de
- * +/-8 %. Ambos pendientes de calibrar por canal en placa real si se exige
- * exactitud absoluta de 10 mV y no solo resolucion. */
+ * de la datasheet (55 ohm tipico, 125 ohm maximo; asignacion de columnas
+ * de la tabla pendiente de confirmar con el PDF original); R_AB tiene una
+ * tolerancia de +/-8 %. Ambos se calibran por canal en placa real, tal y
+ * como recoge la memoria de la etapa analogica (calibracion por canal,
+ * error sin calibrar de +/-15 %). */
 #define AD5144_RAB_OHM             (10000L)
-#define AD5144_RW_OHM              (125L)
+#define AD5144_RW_OHM              (55L)
 #define AD5144_NUM_STEPS           (256L)
 
 /* Resistencia de entrada del inversor de ESA (R1..R8 = 2K5). */

@@ -63,7 +63,7 @@ static void TiaPort_SetTrigger(ADC_HandleTypeDef *hadc, DacBank_t bank)
  *  Estado
  * ------------------------------------------------------------------------- */
 #define TIA_READER_ROTATION_LEN  (8U)
-static const uint8_t kRotation[TIA_READER_ROTATION_LEN] = { 1U, 5U, 2U, 6U, 3U, 7U, 4U, 8U };
+static const uint8_t kRotation[TIA_READER_ROTATION_LEN] = { 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U };
 
 static ADC_HandleTypeDef *s_hadc;
 static uint16_t s_buf[TIA_READER_BUF_SAMPLES];
@@ -76,7 +76,7 @@ static volatile bool s_armed;        /* rafaga solicitada y pendiente         */
 static uint8_t   s_mask;
 static uint8_t   s_ch;               /* canal en medida (1..8), 0 = ninguno   */
 static TiaPlan_t s_plan;
-static uint8_t   s_edge;             /* 0 = primera rafaga, 1 = segunda       */
+static uint8_t   s_edge;             /* rafagas ya medidas del periodo (modo flancos) */
 static uint16_t  s_part_max;
 static uint16_t  s_part_min;
 static uint32_t  s_arm_tick;
@@ -101,7 +101,7 @@ TiaPlan_t TiaReader_PlanFor(uint32_t freq_hz)
         p.mode = TIA_PLAN_PERIOD;
         p.samples = (uint16_t)n;
     } else {
-        p.mode = TIA_PLAN_TWO_EDGES;
+        p.mode = TIA_PLAN_EDGES;
         p.samples = (uint16_t)TIA_READER_EDGE_SAMPLES;
     }
     return p;
@@ -216,22 +216,30 @@ void TiaReader_OnBurstComplete(void)
         if (v < vmin) { vmin = v; }
     }
 
-    if (s_plan.mode == TIA_PLAN_TWO_EDGES && s_edge == 0U) {
-        /* Primera fase medida: se rearma enseguida para el flanco siguiente */
-        s_part_max = vmax;
-        s_part_min = vmin;
-        s_edge = 1U;
-        if (!s_paused && s_running) {
-            if (!ArmBurst(false)) {
-                s_edge = 0U;   /* el banco se ha parado: medida descartada */
-            }
+    if (s_plan.mode == TIA_PLAN_EDGES) {
+        /* Se acumulan el maximo y el minimo de las rafagas del periodo. */
+        if (s_edge == 0U) {
+            s_part_max = vmax;
+            s_part_min = vmin;
+        } else {
+            if (s_part_max > vmax) { vmax = s_part_max; }
+            if (s_part_min < vmin) { vmin = s_part_min; }
+            s_part_max = vmax;
+            s_part_min = vmin;
         }
-        return;
-    }
+        s_edge++;
 
-    if (s_plan.mode == TIA_PLAN_TWO_EDGES) {
-        if (s_part_max > vmax) { vmax = s_part_max; }
-        if (s_part_min < vmin) { vmin = s_part_min; }
+        if (s_edge < TIA_READER_EDGE_BURSTS) {
+            /* Quedan disparos del periodo: se rearma enseguida para el
+             * siguiente (T/4 mas tarde, tiempo de sobra). */
+            if (!s_paused && s_running) {
+                if (!ArmBurst(false)) {
+                    s_edge = 0U;   /* el banco se ha parado: medida descartada */
+                }
+            }
+            return;
+        }
+        /* Cuarta rafaga: el periodo esta completo. */
         s_edge = 0U;
     }
     Accumulate(s_ch, vmax, vmin);
@@ -334,7 +342,7 @@ void TiaReader_Task(void)
         return;
     }
     if (s_edge != 0U) {
-        /* rearme de la segunda fase fallido en la ISR: se descarta */
+        /* rearme de una rafaga intermedia fallido en la ISR: se descarta */
         s_edge = 0U;
     }
     TiaPort_IrqRestore(irq);

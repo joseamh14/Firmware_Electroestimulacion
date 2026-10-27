@@ -9,26 +9,34 @@
  *
  * FUNCIONAMIENTO
  * --------------
- * - Rotacion de canales alternando bancos: 1, 5, 2, 6, 3, 7, 4, 8. Cada
- *   medida se sincroniza con el timer de su banco (TIM1_TRGO para 1-4,
- *   TIM8_TRGO para 5-8): el ADC esta en modo continuo con disparo externo,
- *   y la rafaga arranca exactamente en un flanco de la onda. Como las
- *   medidas son secuenciales, nunca hay dos bancos pidiendo el ADC a la vez.
+ * - Rotacion de canales 1, 2, ..., 8 (apartado 7.12 de la memoria de la
+ *   etapa analogica), un canal por medida. Cada medida se sincroniza con el
+ *   timer de su banco (TIM1_TRGO para 1-4, TIM8_TRGO para 5-8): el ADC esta
+ *   en modo continuo con disparo externo, y la rafaga arranca exactamente
+ *   en un flanco de la onda. Como las medidas son secuenciales, nunca hay
+ *   dos bancos pidiendo el ADC a la vez.
  * - El MAX4581 cambia de canal en cuanto termina la medida anterior y se
  *   espera TIA_READER_SETTLE_US antes de armar la siguiente rafaga, de modo
  *   que el multiplexor ya esta asentado cuando llega el flanco. Conmutar el
  *   MAX4581 no afecta a la estimulacion: cada pocillo tiene su propio TIA.
+ * - Forma de onda: pulso bifasico con reposo (ver dac_waveform.h), de cuatro
+ *   disparos del timer por periodo: fase positiva, fase negativa y dos
+ *   disparos de reposo en VBIAS.
  * - Modo PERIODO (frecuencias medias y altas): una sola rafaga que cubre un
  *   periodo completo de la onda desde el flanco, de modo que contiene las
- *   dos fases. Se usa cuando el periodo cabe en el buffer.
- * - Modo DOS FLANCOS (frecuencias bajas): dos rafagas cortas en flancos
- *   consecutivos (una por fase). Con un semiperiodo de ~100 us o mas hay
- *   tiempo de sobra para rearmar el ADC entre ambas.
+ *   dos fases y el reposo. Se usa cuando el periodo cabe en el buffer.
+ * - Modo FLANCOS (frecuencias bajas): TIA_READER_EDGE_BURSTS (4) rafagas
+ *   cortas, una en cada uno de los cuatro disparos consecutivos del
+ *   periodo, de modo que se cubren las dos fases y el reposo. Entre dos
+ *   disparos hay T/4 (>= ~95 us en el limite del modo), tiempo de sobra
+ *   para rearmar el ADC entre rafagas.
  * - De cada medida se guardan el maximo (pico de la fase positiva) y el
  *   minimo (pico de la fase negativa) en codigos de ADC, y se acumulan por
  *   canal hasta que el registrador recoge la ventana (TiaReader_TakeWindow).
  *   No hace falta saber que flanco es cual: el maximo de un periodo es el
- *   pico positivo y el minimo, el negativo.
+ *   pico positivo y el minimo, el negativo (el reposo queda en VBIAS, entre
+ *   ambos). El valor de corriente que se registra es (I+ - I-)/2, calculado
+ *   en current_calc.
  * - Un banco detenido (frecuencia 0) o un canal fuera de la mascara se
  *   saltan. Si una rafaga no llega en el tiempo esperado (timer parado a
  *   mitad, etc.), TiaReader_Task la aborta y pasa al siguiente canal.
@@ -58,8 +66,9 @@ extern "C" {
 #define TIA_READER_ADC_CLOCK_HZ    (80000000UL)
 #define TIA_READER_ADC_CYCLES      (15UL)      /* 2,5 muestreo + 12,5 conversion */
 #define TIA_READER_FS_HZ           (TIA_READER_ADC_CLOCK_HZ / TIA_READER_ADC_CYCLES)
-#define TIA_READER_BUF_SAMPLES     (1024U)     /* buffer de rafaga (2 KB)        */
-#define TIA_READER_EDGE_SAMPLES    (64U)       /* rafaga por flanco, modo 2 flancos */
+#define TIA_READER_BUF_SAMPLES     (2048U)     /* buffer de rafaga (4 KB)        */
+#define TIA_READER_EDGE_SAMPLES    (64U)       /* rafaga por flanco, modo flancos   */
+#define TIA_READER_EDGE_BURSTS     (4U)        /* rafagas por periodo, modo flancos */
 #define TIA_READER_PERIOD_MARGIN   (8U)        /* muestras extra en modo periodo */
 #define TIA_READER_SETTLE_US       (2U)        /* asentamiento MAX4581 + OPA320  */
 #define TIA_READER_TIMEOUT_EXTRA_MS (20U)      /* margen sobre 2 periodos        */
@@ -67,7 +76,8 @@ extern "C" {
 typedef enum {
     TIA_PLAN_SKIP = 0,      /* banco parado: no se mide                       */
     TIA_PLAN_PERIOD,        /* una rafaga de un periodo completo              */
-    TIA_PLAN_TWO_EDGES      /* dos rafagas cortas en flancos consecutivos     */
+    TIA_PLAN_EDGES          /* TIA_READER_EDGE_BURSTS rafagas cortas en
+                               disparos consecutivos (un periodo completo) */
 } TiaPlanMode_t;
 
 typedef struct {
@@ -89,7 +99,7 @@ typedef struct {
 TiaPlan_t TiaReader_PlanFor(uint32_t freq_hz);
 
 /**
- * @brief  Siguiente canal de la rotacion 1,5,2,6,3,7,4,8 despues de
+ * @brief  Siguiente canal de la rotacion 1,2,...,8 despues de
  *         'current' (0 = empezar), saltando los que no esten en la mascara
  *         (bit i = canal i+1). Devuelve 0 si la mascara esta vacia.
  *         Funcion pura.

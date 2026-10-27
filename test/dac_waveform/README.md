@@ -29,23 +29,23 @@ Compilador por defecto: **LCC-win64** (incluido con MATLAB). Override:
 LCC_ROOT="/c/ruta/a/lcc64/lcc64" bash test/dac_waveform/build_and_run.sh
 ```
 
-Salida esperada: `=== 73 comprobaciones, 0 fallos ===` / `RESULTADO: OK`
+Salida esperada: `=== 77 comprobaciones, 0 fallos ===` / `RESULTADO: OK`
 (código de salida 0).
 
 ## Qué se cubre
 
 | Bloque | Comprobación |
 |---|---|
-| Puntos del Anexo | 1 Hz → PSC=915/ARR=65501 · 100 kHz → 0/599 · 300 kHz → 0/199 |
+| Puntos de referencia | 4 disparos por periodo · 1 Hz → PSC=457/ARR=65501 · 100 kHz → 0/299 · 300 kHz → 0/99 |
 | Entrada 0 Hz | rechazada (`false`), **no** interpretada como "sin división"; no escribe los `*out` |
 | Límite inferior | 1 Hz calculable, ARR y PSC dentro de 16 bits |
 | Techo aritmético | `trigger = Fclk` → ARR=0 (máx. sin prescaler) |
 | Límite superior útil | vía API público: 300000 Hz pasa, 300001 Hz → `HAL_ERROR` sin tocar el timer |
-| Barrido de banda 1 Hz–300 kHz | nunca rechaza · ARR/PSC siempre ≤ 0xFFFF (sin desbordamiento silencioso) · error < 6000 ppm (peor caso ≈ 4998 ppm cerca de 300 kHz, resolución ARR≈200) |
+| Barrido de banda 1 Hz–300 kHz | nunca rechaza · ARR/PSC siempre ≤ 0xFFFF (sin desbordamiento silencioso) · error ≤ 5000 ppm (peor caso ≈ 4998 ppm cerca de 300 kHz, ARR+1≈100 con redondeo al entero más próximo: error máximo de medio paso) |
 | Barrido por décadas | 10/100/1k/10k Hz: error ≤ 10 ppm (peor: 10 Hz ≈ 6 ppm; los demás exactos) |
 | API público | `(PSC,ARR)` llega al timer · `CNT` a 0 en cada reconfiguración · `GetFrequency` coherente · banco inválido → `HAL_ERROR` · 0 Hz para el banco · fallo de `HAL_DAC_Start_DMA` se propaga y el banco no queda activo |
-| Onda centrada en VBIAS | `DAC_CODE_MID` = 2048 · excursión ±690 códigos simétrica · `DAC_DIF_PEAK_MV` = 556 mV |
-| Aparcado del canal | tras `Init`, `Stop`, 0 Hz y fallo de DMA: DAC habilitado, `TENx` = 0 y DHR = 2048 (salida diferencial nula, nunca flotante) · al arrancar la onda `TENx` vuelve a estar activo antes de `HAL_DAC_Start_DMA` · buffer DMA de 2 muestras HIGH/LOW · el otro banco no se ve afectado |
+| Pulso centrado en VBIAS | `DAC_CODE_MID` = 2048 · excursión ±621 códigos simétrica (niveles 2669 / 1427 ≈ 2,15 V / 1,15 V) · `DAC_DIF_PEAK_MV` = 500 mV |
+| Aparcado del canal | tras `Init`, `Stop`, 0 Hz y fallo de DMA: DAC habilitado, `TENx` = 0 y DHR = 2048 (salida diferencial nula, nunca flotante) · al arrancar la onda `TENx` vuelve a estar activo antes de `HAL_DAC_Start_DMA` · buffer DMA de 4 muestras HIGH, LOW, MID, MID (T/4, T/4, T/2; valor medio = VBIAS) en ambos bancos · el otro banco no se ve afectado |
 
 ## Nota sobre el límite superior
 

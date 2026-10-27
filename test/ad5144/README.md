@@ -53,10 +53,10 @@ añadir `-lm` al enlazar.
 | `AD5144_SetChannelRaw` — trama | los 4 canales a `0x7F` y códigos límite `0`/`255`: byte 0, byte 1, dirección, `Size=2`, `Timeout` exactos; una sola transacción por escritura |
 | `AD5144_SetChannelRaw` — `shadow[]` | se actualiza **solo** si la transacción devuelve `HAL_OK`; con `HAL_ERROR`/`HAL_BUSY`/`HAL_TIMEOUT` queda intacto |
 | `AD5144_CodeForMillivolts` — validación | `in_peak_mv=0` o `out_code` NULL → `HAL_ERROR` |
-| Modelo de reóstato | relación inversa; puntos calculados a mano (1000 mV → 144, 2000 mV → 29 con `in_peak`=556 mV); 0 mV y valores por debajo del mínimo → 255; máximo alcanzable exacto (2251 mV → 0) |
+| Modelo de reóstato | relación inversa; puntos calculados a mano (1000 mV → 142, 2000 mV → 27 con `in_peak`=500 mV y R_W = 55 Ω → D = 129 y D = 1); 0 mV y valores por debajo del mínimo (~19 mV) → 255; máximo alcanzable exacto (2011 mV → 0) |
 | Objetivo inalcanzable | `HAL_ERROR` sin transmitir y con el `shadow[]` intacto (no se recorta en silencio) |
 | Barrido | 0…2000 mV en pasos de 1 mV para tres excursiones de entrada: código monótono y error de salida ≤ medio paso frente a un modelo en doble precisión independiente del driver |
-| Margen de diseño | con la excursión de la placa (556 mV) el paso es 8,7 mV; con R_AB −8 % se siguen alcanzando 2 V y con R_AB +8 % el código 0 no supera los ±2,5 V de los terminales |
+| Margen de diseño | con la excursión de la placa (500 mV) el paso es 7,81 mV, el mínimo activo ≈ 18,8 mV y el máximo nominal ≈ 2,01 V (cifras de la memoria de la etapa analógica); con R_AB −8 % el código 0 da ≈ 1,85 V (−7,5 % respecto a 2 V, dentro del ≈ 15 % sin calibrar) y con R_AB +8 % no supera los ±2,5 V de los terminales |
 | `AD5144_AllChannelsZero` — camino feliz | 4 transacciones en orden A,B,C,D con byte 1 = 255; `shadow[]` a 255; nunca escribe el código 0 |
 | `AD5144_AllChannelsZero` — fallo a mitad | no corta el barrido (siempre 4 transacciones); `shadow[]` de los canales que fallan queda intacto; devuelve el estado del **último** fallo |
 | EEPROM — trama | Comando 11 de la datasheet: byte 0 = `0x80 | canal`, byte 1 = dato; no altera el `shadow[]` del RDAC |
