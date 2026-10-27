@@ -4,3 +4,4 @@ Release/
 CLAUDE.md
 contexto_sesion_anterior.md
 .git_old/
+test/*/_build/
