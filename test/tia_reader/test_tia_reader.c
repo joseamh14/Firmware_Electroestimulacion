@@ -351,7 +351,9 @@ static void test_current_log(void)
     CurrentLog_Compute(&w, v);
     CHECK(fabsf(v[0] - 1.1f * i1) < 0.02f, "ganancia aplicada; el offset de calibracion se cancela");
 
-    float vals[8] = { 1.0f, -2.5f, 0.0f, 1000.0f, -1000.0f, 0.125f, 3.0f, CurrentLog_NaN() };
+    /* Inicializador constante (LCC no admite llamadas a funcion en el inicializador). */
+    float vals[8] = { 1.0f, -2.5f, 0.0f, 1000.0f, -1000.0f, 0.125f, 3.0f, 0.0f };
+    vals[7] = CurrentLog_NaN();
     uint8_t rec[36];
     CurrentLog_Pack(0x01020304UL, vals, rec);
     CHECK(rec[0] == 0x04 && rec[1] == 0x03 && rec[2] == 0x02 && rec[3] == 0x01, "ms en little-endian");
